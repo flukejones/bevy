@@ -69,6 +69,7 @@ use bevy_light::{
     cluster::{Clusters, GlobalClusterGpuSettings, GlobalClusterSettings},
     EnvironmentMapLight, IrradianceVolume,
 };
+use bevy_log::error_once;
 use bevy_material::descriptor::{
     BindGroupLayoutDescriptor, CachedComputePipelineId, CachedRenderPipelineId,
     ComputePipelineDescriptor, FragmentState, RenderPipelineDescriptor, VertexState,
@@ -109,7 +110,7 @@ use crate::{
     decal::clustered::{DecalsBuffer, RenderClusteredDecal, RenderClusteredDecals},
     gpu_clustering_is_enabled, ExtractedClusterConfig, GlobalClusterableObjectMeta,
     GpuClusteredLight, GpuLights, LightMeta, LightProbesBuffer, LightProbesUniform,
-    RenderViewLightProbes, ViewClusterBindings, ViewLightProbesUniformOffset,
+    MeshViewBindGroup, RenderViewLightProbes, ViewClusterBindings, ViewLightProbesUniformOffset,
     ViewLightsUniformOffset,
 };
 
@@ -240,9 +241,6 @@ pub struct ClusterMetadata {
     /// The total number of clustered decals, set by the CPU.
     decal_count: u32,
 
-    /// The current maximum size of the Z-slice list.
-    z_slice_list_capacity: u32,
-
     /// The current size of the clustered object index list.
     ///
     /// This is set to 0 by the CPU, and the GPU updates it with the computed
@@ -345,11 +343,6 @@ pub(crate) struct RenderViewClusteringReadbackData {
 
 /// Data associated with reading back clustering statistics for a single view.
 struct ViewClusteringReadbackData {
-    /// The current capacity of the Z slice list.
-    ///
-    /// This starts out at the default size as specified by the allocation and
-    /// can grow based on the results of GPU readback.
-    z_slice_list_capacity: usize,
     /// The current capacity of the clustered object index list.
     ///
     /// This starts out at the default size as specified by the allocation and
@@ -378,14 +371,8 @@ struct ViewClusteringLastFrameStatistics {
 }
 
 impl ViewClusteringReadbackData {
-    /// Creates a new [`ViewClusteringReadbackData`] for a view.
-    ///
-    /// The [`Self::z_slice_list_capacity`] and
-    /// [`Self::max_index_list_capacity`] are calculated based on the initial
-    /// capacities that the application set in the [`GlobalClusterGpuSettings`].
     fn new(settings: &GlobalClusterGpuSettings) -> ViewClusteringReadbackData {
         ViewClusteringReadbackData {
-            z_slice_list_capacity: settings.initial_z_slice_list_capacity,
             max_index_list_capacity: settings.initial_index_list_capacity,
             metadata_staging_pending_buffers: vec![],
             metadata_staging_free_buffers: vec![],
@@ -410,24 +397,6 @@ impl ViewClusteringReadbackData {
     /// Updates this [`ViewClusteringReadbackData`] with new information from
     /// the given metadata read back from the GPU.
     fn update_from_metadata(&mut self, gpu_clustering_metadata: &ClusterMetadata) {
-        // Schedule a resize of the Z slice list if the GPU overflowed.
-        if self.z_slice_list_capacity
-            < gpu_clustering_metadata.indirect_draw_params.instance_count as usize
-        {
-            let new_capacity = gpu_clustering_metadata
-                .indirect_draw_params
-                .instance_count
-                .next_power_of_two();
-            warn!(
-                "Resizing the view clustering Z slice list from a capacity of {0} elements to \
-                a capacity of {1} elements. The scene lighting may have been corrupted for a \
-                few frames. To avoid this, set the `gpu_clustering.z_slice_list_capacity` field \
-                on the `GlobalClusterSettings` resource to at least {1}.",
-                self.z_slice_list_capacity, new_capacity
-            );
-            self.z_slice_list_capacity = new_capacity as usize;
-        }
-
         // Schedule a resize of the index slice list if the GPU overflowed.
         if self.max_index_list_capacity < gpu_clustering_metadata.index_list_capacity as usize {
             let new_capacity = gpu_clustering_metadata
@@ -1641,6 +1610,13 @@ pub(crate) fn prepare_clusters_for_gpu_clustering(
     };
 
     let gpu_clustered_lights_storage = &global_clusterable_object_meta.gpu_clustered_lights;
+    let limits = render_device.limits();
+    let max_z_slice_list_capacity = limits
+        .max_buffer_size
+        .min(limits.max_storage_buffer_binding_size)
+        .min(usize::MAX as u64)
+        / ClusterableObjectZSlice::min_size().get();
+    let max_z_slice_list_capacity = max_z_slice_list_capacity.min(u64::from(u32::MAX)) as usize;
 
     let mut all_view_main_entities = MainEntityHashSet::default();
 
@@ -1654,11 +1630,20 @@ pub(crate) fn prepare_clusters_for_gpu_clustering(
         maybe_existing_cluster_bindings,
     ) in &mut views_query
     {
+        all_view_main_entities.insert(*view_main_entity);
+        if extracted_cluster_config.dimensions.z == 0 {
+            commands.entity(view_entity).remove::<(
+                ViewGpuClusteringBuffers,
+                ViewClusteringBindGroups,
+                ViewClusterBindings,
+                MeshViewBindGroup,
+            )>();
+            continue;
+        }
+
         let cluster_count = extracted_cluster_config.dimensions.x as usize
             * extracted_cluster_config.dimensions.y as usize
             * extracted_cluster_config.dimensions.z as usize;
-
-        all_view_main_entities.insert(*view_main_entity);
 
         // Create the readback data.
         let Ok(view_clustering_buffer_size_data) = render_view_clustering_index_list_sizes
@@ -1676,17 +1661,60 @@ pub(crate) fn prepare_clusters_for_gpu_clustering(
         };
 
         // Count the number of each type of clusterable object that we have.
-        let clustered_light_count = gpu_clustered_lights_storage.data.len() as u32;
+        let clustered_light_count = gpu_clustered_lights_storage.data.len();
         let reflection_probe_count = match maybe_environment_maps {
-            Some(view_reflection_probes) => view_reflection_probes.len() as u32,
+            Some(view_reflection_probes) => view_reflection_probes.len(),
             None => 0,
         };
         let irradiance_volume_count = match maybe_irradiance_volumes {
-            Some(view_irradiance_volumes) => view_irradiance_volumes.len() as u32,
+            Some(view_irradiance_volumes) => view_irradiance_volumes.len(),
             None => 0,
         };
         // Light textures share the decal buffer but aren't clusterable objects.
-        let decal_count = render_clustered_decals.clusterable_decal_count() as u32;
+        let decal_count = render_clustered_decals.clusterable_decal_count();
+        let object_counts = [
+            clustered_light_count,
+            reflection_probe_count,
+            irradiance_volume_count,
+            decal_count,
+        ];
+        let clusterable_object_count = object_counts.into_iter().try_fold(0u32, |total, count| {
+            total.checked_add(u32::try_from(count).ok()?)
+        });
+
+        // Each object can occupy every depth slice. Reserve that bound before
+        // dispatch so indirect draws never reference unwritten slices.
+        let z_slice_list_capacity = clusterable_object_count
+            .filter(|count| {
+                count.div_ceil(Z_SLICING_WORKGROUP_SIZE)
+                    <= limits.max_compute_workgroups_per_dimension
+            })
+            .and_then(|count| count.checked_mul(extracted_cluster_config.dimensions.z))
+            .map(|count| count.max(1) as usize)
+            .filter(|capacity| *capacity <= max_z_slice_list_capacity)
+            .map(|capacity| {
+                capacity.max(
+                    global_cluster_settings_gpu
+                        .initial_z_slice_list_capacity
+                        .min(max_z_slice_list_capacity),
+                )
+            });
+        let Some(z_slice_list_capacity) = z_slice_list_capacity else {
+            error_once!(
+                "GPU clustering for view {view_entity:?} cannot fit object counts \
+                {object_counts:?} across {} depth slices: the device supports at most \
+                {max_z_slice_list_capacity} Z slices and {} Z-slicing workgroups",
+                extracted_cluster_config.dimensions.z,
+                limits.max_compute_workgroups_per_dimension,
+            );
+            commands.entity(view_entity).remove::<(
+                ViewGpuClusteringBuffers,
+                ViewClusteringBindGroups,
+                ViewClusterBindings,
+                MeshViewBindGroup,
+            )>();
+            continue;
+        };
 
         let new_metadata = ClusterMetadata {
             indirect_draw_params: ClusterRasterIndirectDrawParams {
@@ -1697,12 +1725,11 @@ pub(crate) fn prepare_clusters_for_gpu_clustering(
                 base_vertex: 0,
                 first_instance: 0,
             },
-            clustered_light_count,
-            reflection_probe_count,
-            irradiance_volume_count,
-            decal_count,
+            clustered_light_count: clustered_light_count as u32,
+            reflection_probe_count: reflection_probe_count as u32,
+            irradiance_volume_count: irradiance_volume_count as u32,
+            decal_count: decal_count as u32,
             index_list_capacity: view_clustering_buffer_size_data.max_index_list_capacity as u32,
-            z_slice_list_capacity: view_clustering_buffer_size_data.z_slice_list_capacity as u32,
             farthest_z: 0,
         };
 
@@ -1723,18 +1750,10 @@ pub(crate) fn prepare_clusters_for_gpu_clustering(
         }
 
         if let Some(mut b) = maybe_existing_buffers {
-            b.update(
-                new_metadata,
-                view_clustering_buffer_size_data.z_slice_list_capacity,
-                cluster_count,
-            );
+            b.update(new_metadata, z_slice_list_capacity, cluster_count);
         } else {
             let mut b = ViewGpuClusteringBuffers::new();
-            b.update(
-                new_metadata,
-                view_clustering_buffer_size_data.z_slice_list_capacity,
-                cluster_count,
-            );
+            b.update(new_metadata, z_slice_list_capacity, cluster_count);
             entity_commands.insert(b);
         }
     }
@@ -1751,5 +1770,314 @@ impl ExtractResource<RenderApp, GpuClusteringPlugin> for GlobalClusterSettings {
 
     fn extract_resource(source: &Self::Source) -> Self {
         source.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_asset::Assets;
+    use bevy_ecs::system::RunSystemOnce;
+    use bevy_math::{Mat4, UVec3, UVec4, Vec4};
+    use bevy_platform::{collections::HashMap, future::block_on};
+    use bevy_render::render_resource::UniformBuffer;
+    use bevy_shader::{ShaderCache, ShaderCacheSource, ShaderImport};
+    use std::{fs::read_to_string, path::Path, sync::mpsc::sync_channel, time::Duration};
+    use wgpu::{
+        util::DeviceExt, Backends, BindGroupDescriptor,
+        ComputePipelineDescriptor as WgpuComputePipelineDescriptor, DeviceDescriptor, Instance,
+        InstanceDescriptor, PollType, ShaderModuleDescriptor, ShaderSource,
+    };
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn z_slicing_grows_before_dispatch_without_losing_slices() {
+        let instance = Instance::new(InstanceDescriptor {
+            backends: Backends::all(),
+            flags: default(),
+            memory_budget_thresholds: default(),
+            display: None,
+            backend_options: default(),
+        });
+        let adapter = block_on(instance.request_adapter(&default())).unwrap();
+        let (device, queue) = block_on(adapter.request_device(&DeviceDescriptor {
+            required_limits: adapter.limits(),
+            ..default()
+        }))
+        .unwrap();
+        let render_device = RenderDevice::from(device.clone());
+        let render_queue = RenderQueue::new(queue.clone());
+        let mut world = World::new();
+        world.insert_resource(render_device.clone());
+        world.insert_resource(render_queue.clone());
+        world.insert_resource(GlobalClusterSettings {
+            supports_storage_buffers: true,
+            clustered_decals_are_usable: false,
+            gpu_clustering: Some(GlobalClusterGpuSettings {
+                initial_z_slice_list_capacity: 1,
+                initial_index_list_capacity: 1,
+            }),
+            max_uniform_buffer_clusterable_objects: 0,
+            view_cluster_bindings_max_indices: 0,
+        });
+        world.init_resource::<RenderClusteredDecals>();
+        world.init_resource::<RenderViewClusteringReadbackData>();
+        let mut objects =
+            GlobalClusterableObjectMeta::new(BufferBindingType::Storage { read_only: true });
+        // These spheres cover every depth slice, including the first and last.
+        for _ in 0..65 {
+            objects.gpu_clustered_lights.add(GpuClusteredLight {
+                position_radius: Vec4::new(0.0, 0.0, -5.0, 0.0),
+                range: 100.0,
+                ..default()
+            });
+        }
+        objects
+            .gpu_clustered_lights
+            .write_buffer(&render_device, &render_queue);
+        world.insert_resource(objects);
+        let mut buffers = ViewGpuClusteringBuffers::new();
+        buffers.z_slices_buffer =
+            UninitBufferVec::new(BufferUsages::STORAGE | BufferUsages::COPY_SRC);
+        let view = world.spawn_empty().id();
+        world.entity_mut(view).insert((
+            MainEntity::from(view),
+            ExtractedClusterConfig {
+                near: 0.0,
+                far: 10.0,
+                dimensions: UVec3::new(1, 1, 24),
+            },
+            buffers,
+        ));
+        world
+            .run_system_once(prepare_clusters_for_gpu_clustering)
+            .unwrap();
+        world
+            .run_system_once(upload_view_gpu_clustering_buffers)
+            .unwrap();
+
+        let mut shader_cache = ShaderCache::new((), |_, source, _| match source {
+            ShaderCacheSource::Wgsl(source) => Ok(source),
+            _ => unreachable!(),
+        });
+        let assets = Assets::<Shader>::default();
+        let mut modules = HashMap::<String, Handle<Shader>>::default();
+        let mut pending = vec!["bevy_pbr::cluster::cluster_z_slice".to_owned()];
+        while let Some(module) = pending.pop() {
+            if modules.contains_key(&module) {
+                continue;
+            }
+            let Some((crate_name, module_path)) = module.split_once("::") else {
+                continue;
+            };
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join(crate_name)
+                .join("src")
+                .join(module_path.replace("::", "/"))
+                .with_extension("wesl");
+            if !path.is_file() {
+                continue;
+            }
+            let shader = Shader::from_wesl(
+                read_to_string(path).unwrap(),
+                format!("embedded://{}.wesl", module.replace("::", "/")),
+            );
+            pending.extend(shader.imports.iter().filter_map(|import| match import {
+                ShaderImport::Custom(path) => Some(path.clone()),
+                _ => None,
+            }));
+            let handle = assets.reserve_handle();
+            shader_cache.set_shader(handle.id(), shader);
+            modules.insert(module, handle);
+        }
+        let source = shader_cache
+            .get(
+                0,
+                modules["bevy_pbr::cluster::cluster_z_slice"].id(),
+                &[
+                    ShaderDefVal::Bool("AVAILABLE_STORAGE_BUFFER_BINDINGS__GE_3".into(), true),
+                    ShaderDefVal::UInt(
+                        "MAX_DIRECTIONAL_LIGHTS".into(),
+                        crate::MAX_DIRECTIONAL_LIGHTS as u32,
+                    ),
+                    ShaderDefVal::UInt(
+                        "MAX_CASCADES_PER_LIGHT".into(),
+                        crate::MAX_CASCADES_PER_LIGHT as u32,
+                    ),
+                    ShaderDefVal::UInt("MAX_RECT_LIGHTS".into(), crate::MAX_RECT_LIGHTS as u32),
+                ],
+            )
+            .unwrap();
+        let module = device.create_shader_module(ShaderModuleDescriptor {
+            label: None,
+            source: ShaderSource::Wgsl(source.as_str().into()),
+        });
+        let pipeline = device.create_compute_pipeline(&WgpuComputePipelineDescriptor {
+            label: None,
+            layout: None,
+            module: &module,
+            entry_point: Some("z_slice_main"),
+            compilation_options: default(),
+            cache: None,
+        });
+
+        let mut lights = vec![0; GpuLights::min_size().get() as usize];
+        let dimensions_offset = GpuLights::METADATA.offset(2) as usize;
+        lights[dimensions_offset..dimensions_offset + 16]
+            .copy_from_slice(bytemuck::bytes_of(&UVec4::new(1, 1, 24, 24)));
+        let factors_offset = GpuLights::METADATA.offset(3) as usize;
+        lights[factors_offset..factors_offset + 16]
+            .copy_from_slice(bytemuck::bytes_of(&Vec4::new(1.0, 1.0, 0.0, -2.4)));
+        let lights = device.create_buffer_init(&BufferInitDescriptor {
+            label: None,
+            contents: &lights,
+            usage: BufferUsages::UNIFORM,
+        });
+        let mut view_uniform = ViewUniform::create_from(
+            &mut Reader::new::<ViewUniform>(vec![0; ViewUniform::min_size().get() as usize], 0)
+                .unwrap(),
+        );
+        view_uniform.view_from_world = Mat4::IDENTITY;
+        view_uniform.world_from_view = Mat4::IDENTITY;
+        view_uniform.clip_from_view = Mat4::from_diagonal(Vec4::new(1.0, 1.0, -0.1, 1.0));
+        let mut view_uniform = UniformBuffer::from(view_uniform);
+        view_uniform.write_buffer(&render_device, &render_queue);
+        let mut probes = UniformBuffer::from(LightProbesUniform::default());
+        probes.write_buffer(&render_device, &render_queue);
+        let decals = device.create_buffer(&BufferDescriptor {
+            label: None,
+            size: RenderClusteredDecal::min_size().get(),
+            usage: BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let buffers = world
+            .entity(view)
+            .get::<ViewGpuClusteringBuffers>()
+            .unwrap();
+        let slices = buffers.z_slices_buffer.buffer().unwrap();
+        let metadata = buffers.cluster_metadata_buffer.buffer().unwrap();
+        let entries = [
+            metadata.as_entire_binding(),
+            slices.as_entire_binding(),
+            world
+                .resource::<GlobalClusterableObjectMeta>()
+                .gpu_clustered_lights
+                .binding()
+                .unwrap(),
+            probes.binding().unwrap(),
+            decals.as_entire_binding(),
+            lights.as_entire_binding(),
+            view_uniform.binding().unwrap(),
+        ];
+        let entries: Vec<_> = entries
+            .into_iter()
+            .enumerate()
+            .map(|(binding, resource)| BindGroupEntry {
+                binding: binding as u32,
+                resource,
+            })
+            .collect();
+        let bind_group = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &entries,
+        });
+        let readback = device.create_buffer(&BufferDescriptor {
+            label: None,
+            size: metadata.size() + slices.size(),
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&default());
+        {
+            let mut pass = encoder.begin_compute_pass(&default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(2, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(metadata, 0, &readback, 0, Some(metadata.size()));
+        encoder.copy_buffer_to_buffer(slices, 0, &readback, metadata.size(), Some(slices.size()));
+        let submission = queue.submit([encoder.finish()]);
+        let (sender, receiver) = sync_channel(1);
+        readback.map_async(MapMode::Read, .., move |result| {
+            sender.send(result).unwrap();
+        });
+        device
+            .poll(PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(Duration::from_secs(10)),
+            })
+            .unwrap();
+        receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        let data = readback.get_mapped_range(..).unwrap();
+        let metadata = ClusterMetadata::create_from(
+            &mut Reader::new::<ClusterMetadata>(&data[..], 0).unwrap(),
+        );
+        assert_eq!(metadata.indirect_draw_params.instance_count, 1560);
+        let mut seen = [[false; 24]; 65];
+        for slice in data[ClusterMetadata::min_size().get() as usize..]
+            .as_chunks::<12>()
+            .0
+            .iter()
+            .take(1560)
+        {
+            let slice = bytemuck::pod_read_unaligned::<ClusterableObjectZSlice>(slice);
+            assert_eq!(slice.object_type, 0);
+            let seen = &mut seen[slice.object_index as usize][slice.z_slice as usize];
+            assert!(!*seen, "duplicate light/slice pair");
+            *seen = true;
+        }
+        assert!(seen.into_iter().flatten().all(|seen| seen));
+        drop(data);
+        readback.unmap();
+
+        for unsupported_depth in [
+            0,
+            u32::try_from(device.limits().max_storage_buffer_binding_size / (12 * 65) + 1)
+                .unwrap_or(u32::MAX),
+            u32::MAX,
+        ] {
+            let retained_bind_group = BindGroup::from(bind_group.clone());
+            world.entity_mut(view).insert(MeshViewBindGroup {
+                main: retained_bind_group.clone(),
+                main_offsets: default(),
+                binding_array: retained_bind_group.clone(),
+                empty: retained_bind_group,
+            });
+            world
+                .entity_mut(view)
+                .get_mut::<ExtractedClusterConfig>()
+                .unwrap()
+                .dimensions
+                .z = unsupported_depth;
+            world
+                .run_system_once(prepare_clusters_for_gpu_clustering)
+                .unwrap();
+            assert!(world
+                .entity(view)
+                .get::<ViewGpuClusteringBuffers>()
+                .is_none());
+            assert!(world.entity(view).get::<ViewClusterBindings>().is_none());
+            assert!(world.entity(view).get::<MeshViewBindGroup>().is_none());
+            world
+                .entity_mut(view)
+                .get_mut::<ExtractedClusterConfig>()
+                .unwrap()
+                .dimensions
+                .z = 24;
+            world
+                .run_system_once(prepare_clusters_for_gpu_clustering)
+                .unwrap();
+            assert!(world
+                .entity(view)
+                .get::<ViewGpuClusteringBuffers>()
+                .is_some());
+            assert!(world.entity(view).get::<ViewClusterBindings>().is_some());
+        }
     }
 }

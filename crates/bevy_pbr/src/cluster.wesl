@@ -23,7 +23,6 @@ struct ClusterMetadata {
     irradiance_volume_count: u32,
     decal_count: u32,
 
-    z_slice_list_capacity: u32,
     index_list_size: u32,
 
     farthest_z: atomic<u32>,

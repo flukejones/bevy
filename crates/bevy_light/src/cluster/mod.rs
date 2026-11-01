@@ -56,13 +56,12 @@ pub struct GlobalClusterSettings {
 pub struct GlobalClusterGpuSettings {
     /// The initial capacity of the list of Z slices.
     ///
-    /// If there are too many clusterable objects on screen, this can overflow.
-    /// Bevy will detect this situation and resize it, but you might see a few
-    /// incorrect frames before Bevy resizes the list. To avoid this issue, you
-    /// can set this to a higher value.
+    /// Bevy reserves enough space for every clusterable object before clustering.
+    /// A higher initial capacity avoids reallocations as the scene grows. This
+    /// reservation is limited to the device's maximum storage buffer size.
     ///
     /// The default value is
-    /// `bevy::pbr::cluster::GPU_CLUSTERING_INITIAL_Z_SLICE_LIST_SIZE`.
+    /// `bevy::pbr::cluster::GPU_CLUSTERING_INITIAL_Z_SLICE_LIST_CAPACITY`.
     pub initial_z_slice_list_capacity: usize,
 
     /// The initial capacity of the list of clusterable objects.
