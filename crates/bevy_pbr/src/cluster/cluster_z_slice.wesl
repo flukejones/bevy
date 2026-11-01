@@ -135,24 +135,11 @@ fn z_slice_main(
 
     // Write out our Z slices.
     for (var z_slice = cluster_bounds.min.z; z_slice <= cluster_bounds.max.z; z_slice += 1u) {
-        try_write_z_slice(object_index, object_type, z_slice);
+        let z_slice_offset = atomicAdd(&cluster_metadata.indirect_draw_params.instance_count, 1u);
+        z_slices[z_slice_offset].object_index = object_index;
+        z_slices[z_slice_offset].object_type = object_type;
+        z_slices[z_slice_offset].z_slice = z_slice;
     }
-}
-
-/// Writes a Z slice to the list.
-///
-/// This silently fails if the list is too small, but it still updates the
-/// instance count, which the CPU reads back. So, if the list is too small, the
-/// CPU will end up being notified and can resize the buffer.
-fn try_write_z_slice(object_index: u32, object_type: u32, z_slice: u32) {
-    let z_slice_offset = atomicAdd(&cluster_metadata.indirect_draw_params.instance_count, 1u);
-    if (z_slice_offset >= cluster_metadata.z_slice_list_capacity) {
-        return;
-    }
-
-    z_slices[z_slice_offset].object_index = object_index;
-    z_slices[z_slice_offset].object_type = object_type;
-    z_slices[z_slice_offset].z_slice = z_slice;
 }
 
 /// Records the farthest Z value for clusterable objects in this workgroup for
