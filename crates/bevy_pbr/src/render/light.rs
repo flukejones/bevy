@@ -468,7 +468,7 @@ pub fn extract_lights(
     {
         if !view_visibility.get() {
             if let Ok(mut entity_commands) = commands.get_entity(render_entity) {
-                entity_commands.remove::<ExtractedPointLight>();
+                entity_commands.remove_with_requires::<ExtractedPointLight>();
             }
             continue;
         }
@@ -600,7 +600,7 @@ pub fn extract_lights(
     {
         if !view_visibility.get() {
             if let Ok(mut entity_commands) = commands.get_entity(render_entity) {
-                entity_commands.remove::<ExtractedPointLight>();
+                entity_commands.remove_with_requires::<ExtractedPointLight>();
             }
             continue;
         }
@@ -1572,10 +1572,11 @@ pub fn prepare_lights(
     let mut live_views = EntityHashSet::with_capacity(views_count);
 
     // TODO: this should select lights based on relevance to the view instead of the first ones that show up in a query
-    for light_entity in point_light_entities
+    for (light_index, light_entity) in point_light_entities
         .iter()
         // Lights are sorted, shadow enabled lights are first
-        .take(point_light_count.min(max_texture_cubes))
+        .take(point_light_count)
+        .enumerate()
     {
         let (
             _,
@@ -1586,7 +1587,7 @@ pub fn prepare_lights(
             (point_light_frusta, _),
         ) = point_lights.get_mut(*light_entity).unwrap();
 
-        if !light.shadow_maps_enabled {
+        if !light.shadow_maps_enabled || light_index >= max_texture_cubes {
             despawn_entities(
                 &mut commands,
                 mem::take(&mut point_and_spot_light_view_entities.0),
@@ -1649,7 +1650,6 @@ pub fn prepare_lights(
     for (light_index, light_entity) in point_light_entities
         .iter()
         .skip(point_light_count)
-        .take(spot_light_count)
         .enumerate()
     {
         let (
@@ -1661,7 +1661,7 @@ pub fn prepare_lights(
             (_, spot_light_frustum),
         ) = point_lights.get_mut(*light_entity).unwrap();
 
-        if !light.shadow_maps_enabled {
+        if !light.shadow_maps_enabled || light_index >= spot_light_count {
             despawn_entities(
                 &mut commands,
                 mem::take(&mut point_and_spot_light_view_entities.0),
@@ -3160,5 +3160,262 @@ pub fn extract_shadow_lod_origin(
             render_shadow_lod_origin.0 = global_transform.translation();
         }
         None => render_shadow_lod_origin.0 = Default::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_math::UVec3;
+    use bevy_platform::future::block_on;
+    use bevy_render::{camera::SortedCamera, MainWorld};
+    use wgpu::{
+        BackendOptions, Backends, DeviceDescriptor, Instance, InstanceDescriptor,
+        NoopBackendOptions, RequestAdapterOptions,
+    };
+
+    #[derive(Clone, Copy, Debug)]
+    enum ShadowLightKind {
+        Point,
+        Spot,
+    }
+
+    impl ShadowLightKind {
+        fn spawn(self, world: &mut World, shadows_enabled: bool) -> (Entity, Entity) {
+            let render_entity = world.spawn_empty().id();
+            let mut main_world = world.resource_mut::<MainWorld>();
+            let mut entity =
+                main_world.spawn((RenderEntity::from(render_entity), ViewVisibility::VISIBLE));
+            match self {
+                Self::Point => entity.insert(PointLight {
+                    shadow_maps_enabled: shadows_enabled,
+                    ..default()
+                }),
+                Self::Spot => entity.insert(SpotLight {
+                    shadow_maps_enabled: shadows_enabled,
+                    ..default()
+                }),
+            };
+            (entity.id(), render_entity)
+        }
+
+        fn set_shadows_enabled(self, world: &mut World, entity: Entity, enabled: bool) {
+            let mut main_world = world.resource_mut::<MainWorld>();
+            match self {
+                Self::Point => {
+                    main_world
+                        .get_mut::<PointLight>(entity)
+                        .unwrap()
+                        .shadow_maps_enabled = enabled;
+                }
+                Self::Spot => {
+                    main_world
+                        .get_mut::<SpotLight>(entity)
+                        .unwrap()
+                        .shadow_maps_enabled = enabled;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn point_and_spot_shadow_views_follow_light_eligibility() {
+        for (kind, competing_lights, shadow_views) in [
+            (ShadowLightKind::Point, 1, 6),
+            (ShadowLightKind::Spot, 6, 1),
+        ] {
+            let mut world = shadow_world();
+            let mut schedule = Schedule::default();
+            schedule.add_systems((extract_lights, prepare_lights).chain());
+
+            let competitors: Vec<_> = (0..competing_lights)
+                .map(|_| {
+                    let (main_entity, _) = kind.spawn(&mut world, false);
+                    world
+                        .resource_mut::<MainWorld>()
+                        .entity_mut(main_entity)
+                        .insert(VolumetricLight);
+                    main_entity
+                })
+                .collect();
+            let (main_entity, render_entity) = kind.spawn(&mut world, true);
+
+            run_shadow_frame(&mut world, &mut schedule);
+            let original_views = shadow_views_in_world(&mut world);
+            assert_eq!(original_views.len(), shadow_views, "{kind:?}");
+            for view in &original_views {
+                assert!(world.get::<RootNonCameraView>(*view).is_some(), "{kind:?}");
+            }
+
+            world
+                .resource_mut::<MainWorld>()
+                .entity_mut(main_entity)
+                .insert(ViewVisibility::HIDDEN);
+            run_shadow_frame(&mut world, &mut schedule);
+            assert!(
+                original_views
+                    .iter()
+                    .all(|view| !world.entities().contains(*view)),
+                "{kind:?}"
+            );
+            assert!(
+                world.get::<ExtractedPointLight>(render_entity).is_none(),
+                "{kind:?}"
+            );
+            assert!(shadow_views_in_world(&mut world).is_empty(), "{kind:?}");
+
+            world
+                .resource_mut::<MainWorld>()
+                .entity_mut(main_entity)
+                .insert(ViewVisibility::VISIBLE);
+            run_shadow_frame(&mut world, &mut schedule);
+            let restored_views = shadow_views_in_world(&mut world);
+            assert_eq!(restored_views.len(), shadow_views, "{kind:?}");
+
+            kind.set_shadows_enabled(&mut world, main_entity, false);
+            run_shadow_frame(&mut world, &mut schedule);
+            assert!(
+                restored_views
+                    .iter()
+                    .all(|view| !world.entities().contains(*view)),
+                "{kind:?}"
+            );
+            assert!(
+                world.get::<ExtractedPointLight>(render_entity).is_some(),
+                "{kind:?}"
+            );
+            assert!(shadow_views_in_world(&mut world).is_empty(), "{kind:?}");
+
+            kind.set_shadows_enabled(&mut world, main_entity, true);
+            run_shadow_frame(&mut world, &mut schedule);
+            let restored_views = shadow_views_in_world(&mut world);
+            assert_eq!(restored_views.len(), shadow_views, "{kind:?}");
+
+            for competitor in &competitors {
+                kind.set_shadows_enabled(&mut world, *competitor, true);
+            }
+            run_shadow_frame(&mut world, &mut schedule);
+            assert!(
+                restored_views
+                    .iter()
+                    .all(|view| !world.entities().contains(*view)),
+                "{kind:?}"
+            );
+            assert!(
+                world.get::<ExtractedPointLight>(render_entity).is_some(),
+                "{kind:?}"
+            );
+            let competing_views = shadow_views_in_world(&mut world);
+            assert_eq!(competing_views.len(), 6, "{kind:?}");
+
+            for competitor in &competitors {
+                kind.set_shadows_enabled(&mut world, *competitor, false);
+            }
+            run_shadow_frame(&mut world, &mut schedule);
+            assert!(
+                competing_views
+                    .iter()
+                    .all(|view| !world.entities().contains(*view)),
+                "{kind:?}"
+            );
+            assert_eq!(
+                shadow_views_in_world(&mut world).len(),
+                shadow_views,
+                "{kind:?}"
+            );
+        }
+    }
+
+    fn shadow_world() -> World {
+        let instance = Instance::new(InstanceDescriptor {
+            backends: Backends::NOOP,
+            flags: default(),
+            memory_budget_thresholds: default(),
+            display: None,
+            backend_options: BackendOptions {
+                noop: NoopBackendOptions {
+                    enable: true,
+                    ..default()
+                },
+                ..default()
+            },
+        });
+        let adapter =
+            block_on(instance.request_adapter(&RequestAdapterOptions::default())).unwrap();
+        let (device, queue) = block_on(adapter.request_device(&DeviceDescriptor {
+            required_limits: wgpu::Limits {
+                max_texture_array_layers: 6,
+                ..default()
+            },
+            ..default()
+        }))
+        .unwrap();
+
+        let mut main_world = MainWorld::default();
+        main_world.insert_resource(PointLightShadowMap { size: 16 });
+        main_world.insert_resource(DirectionalLightShadowMap { size: 16 });
+        let camera_main_entity = main_world.spawn_empty().id();
+        let mut world = World::new();
+        world.insert_resource(main_world);
+        world.insert_resource(RenderDevice::from(device));
+        world.insert_resource(RenderQueue::new(queue));
+        world.init_resource::<TextureCache>();
+        world.init_resource::<LightMeta>();
+        world.init_resource::<GlobalAmbientLight>();
+        world.init_resource::<ViewBinnedRenderPhases<Shadow>>();
+        world.init_resource::<LightKeyCache>();
+        world.init_resource::<SpecializedShadowMaterialPipelineCache>();
+        world.insert_resource(GlobalClusterableObjectMeta::new(
+            BufferBindingType::Storage { read_only: true },
+        ));
+        world.insert_resource(GpuPreprocessingSupport {
+            max_supported_mode: GpuPreprocessingMode::None,
+        });
+        world.add_observer(remove_point_and_spot_light_view_entities);
+        let camera = world
+            .spawn((
+                Camera3d::default(),
+                MainEntity::from(camera_main_entity),
+                ExtractedView {
+                    retained_view_entity: RetainedViewEntity::new(
+                        camera_main_entity.into(),
+                        None,
+                        0,
+                    ),
+                    world_from_view: GlobalTransform::IDENTITY,
+                    clip_from_view: Mat4::IDENTITY,
+                    clip_from_world: None,
+                    viewport: UVec4::new(0, 0, 1, 1),
+                    target_format: TextureFormat::Rgba8Unorm,
+                    color_grading: default(),
+                    invert_culling: false,
+                },
+                ExtractedClusterConfig {
+                    near: 0.1,
+                    far: 100.0,
+                    dimensions: UVec3::ONE,
+                },
+            ))
+            .id();
+        world.insert_resource(SortedCameras(vec![SortedCamera {
+            entity: camera,
+            order: 0,
+            target: None,
+            output_mode: default(),
+        }]));
+        world
+    }
+
+    fn run_shadow_frame(world: &mut World, schedule: &mut Schedule) {
+        schedule.run(world);
+        // Extraction observes main-world ticks independently of render systems.
+        world.resource_mut::<MainWorld>().clear_trackers();
+    }
+
+    fn shadow_views_in_world(world: &mut World) -> Vec<Entity> {
+        world
+            .query_filtered::<Entity, With<ShadowView>>()
+            .iter(world)
+            .collect()
     }
 }
