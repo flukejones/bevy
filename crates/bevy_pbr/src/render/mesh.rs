@@ -76,7 +76,7 @@ use bevy_transform::components::GlobalTransform;
 use bevy_utils::{default, Parallel, TypeIdHashMap};
 use core::any::TypeId;
 use core::iter;
-use core::mem::size_of;
+use core::mem::{replace, size_of, take};
 use core::sync::atomic::{AtomicU64, Ordering};
 use indexmap::IndexSet;
 use static_assertions::const_assert_eq;
@@ -110,6 +110,7 @@ use bevy_tasks::ComputeTaskPool;
 
 use bytemuck::{Pod, Zeroable};
 use nonmax::{NonMaxU16, NonMaxU32};
+use smallvec::SmallVec;
 
 /// Provides support for rendering 3D meshes.
 pub struct MeshRenderPlugin {
@@ -3800,6 +3801,9 @@ impl SpecializedMeshPipeline for MeshPipeline {
     }
 }
 
+// Phase collection swaps the rendered and next-frame instance buffers.
+const LIGHTMAP_MODEL_BUFFER_SETS: usize = 2;
+
 /// The bind groups for meshes currently loaded.
 ///
 /// If GPU mesh preprocessing isn't in use, these are global to the scene. If
@@ -3811,7 +3815,21 @@ pub struct MeshPhaseBindGroups {
     skinned: HashMap<MeshSlabId, MeshBindGroupPair>,
     /// Bind groups for meshes with morph targets.
     morph_targets: MeshMorphTargetBindGroups,
-    lightmaps: HashMap<(MeshSlabId, LightmapSlabIndex), BindGroup>,
+    lightmaps: HashMap<
+        (MeshSlabId, LightmapSlabIndex),
+        SmallVec<[LightmapMeshBindGroup; LIGHTMAP_MODEL_BUFFER_SETS]>,
+    >,
+}
+
+struct LightmapMeshBindGroup {
+    bind_group: BindGroup,
+    model: Buffer,
+    model_offset: BufferAddress,
+    model_size: Option<BufferSize>,
+    metadata: BufferId,
+    layout: BindGroupLayoutId,
+    images: [Option<(TextureViewId, SamplerId)>; LIGHTMAPS_PER_SLAB],
+    bindless: bool,
 }
 
 /// Stores bind groups for each mesh with morph targets.
@@ -3950,13 +3968,74 @@ impl MeshPhaseBindGroups {
                 .skinned
                 .get(&metadata_slab_id)
                 .map(|bind_group_pair| bind_group_pair.get(motion_vectors)),
-            (false, MeshMorphBindGroupKey::NoMorphTargets, Some(lightmap_slab)) => {
-                self.lightmaps.get(&(metadata_slab_id, lightmap_slab))
-            }
+            (false, MeshMorphBindGroupKey::NoMorphTargets, Some(lightmap_slab)) => self
+                .lightmaps
+                .get(&(metadata_slab_id, lightmap_slab))
+                .and_then(|cached| cached.first())
+                .map(|cached| &cached.bind_group),
             (false, MeshMorphBindGroupKey::NoMorphTargets, None) => {
                 self.model_only.get(&metadata_slab_id)
             }
         }
+    }
+    fn begin_frame(&mut self, lightmap_pairs: &HashSet<(MeshSlabId, LightmapSlabIndex)>) {
+        self.model_only.clear();
+        self.skinned.clear();
+        self.morph_targets.clear();
+        self.lightmaps.retain(|key, _| lightmap_pairs.contains(key));
+    }
+
+    fn prepare_lightmap(
+        &mut self,
+        key: (MeshSlabId, LightmapSlabIndex),
+        model: &BufferBinding,
+        metadata: &Buffer,
+        slab: &LightmapSlab,
+        bindless: bool,
+        layouts: &MeshLayouts,
+        render_device: &RenderDevice,
+        pipeline_cache: &PipelineCache,
+    ) {
+        let layout = pipeline_cache
+            .get_bind_group_layout(&layouts.lightmapped)
+            .id();
+        let images = slab.binding_ids();
+        let cached = self.lightmaps.entry(key).or_default();
+        cached.retain(|cached| {
+            cached.metadata == metadata.id()
+                && cached.layout == layout
+                && cached.images == images
+                && cached.bindless == bindless
+        });
+        if let Some(index) = cached.iter().position(|cached| {
+            &*cached.model == model.buffer
+                && cached.model_offset == model.offset
+                && cached.model_size == model.size
+        }) {
+            cached.swap(0, index);
+            return;
+        }
+        cached.truncate(LIGHTMAP_MODEL_BUFFER_SETS - 1);
+        cached.insert(
+            0,
+            LightmapMeshBindGroup {
+                bind_group: layouts.lightmapped(
+                    render_device,
+                    pipeline_cache,
+                    &BindingResource::Buffer(model.clone()),
+                    metadata,
+                    slab,
+                    bindless,
+                ),
+                model: Buffer::from(model.buffer.clone()),
+                model_offset: model.offset,
+                model_size: model.size,
+                metadata: metadata.id(),
+                layout,
+                images,
+                bindless,
+            },
+        );
     }
 }
 
@@ -4009,7 +4088,22 @@ pub fn prepare_mesh_bind_groups(
     render_lightmaps: Res<RenderLightmaps>,
     metadata_fallback_buffer: Res<MeshMetadataFallbackBuffer>,
     mut mesh_bind_groups: Option<ResMut<MeshBindGroups>>,
+    mesh_instances: Res<RenderMeshInstances>,
+    mut lightmap_pairs: Local<HashSet<(MeshSlabId, LightmapSlabIndex)>>,
 ) {
+    lightmap_pairs.clear();
+    lightmap_pairs.reserve(render_lightmaps.render_lightmaps.len());
+    for (entity, lightmap) in &render_lightmaps.render_lightmaps {
+        let Some(mesh_asset_id) = mesh_instances.mesh_asset_id(*entity) else {
+            continue;
+        };
+        let metadata_slab = mesh_allocator
+            .mesh_slabs(&mesh_asset_id)
+            .and_then(|slabs| slabs.metadata_slab_id)
+            .unwrap_or(metadata_fallback_buffer.slab_id);
+        lightmap_pairs.insert((metadata_slab, lightmap.slab_index));
+    }
+
     // CPU mesh preprocessing path.
     if let Some(cpu_batched_instance_buffer) = cpu_batched_instance_buffer
         && let Some(instance_data_binding) = cpu_batched_instance_buffer
@@ -4021,15 +4115,11 @@ pub fn prepare_mesh_bind_groups(
             None | Some(MeshBindGroups::GpuPreprocessing(_)) => {
                 MeshPhaseBindGroups::new(&render_device)
             }
-            Some(MeshBindGroups::CpuPreprocessing(cpu_preprocessing_mesh_bind_groups)) => {
-                core::mem::replace(
-                    cpu_preprocessing_mesh_bind_groups,
-                    MeshPhaseBindGroups::new(&render_device),
-                )
-            }
+            Some(MeshBindGroups::CpuPreprocessing(cpu_preprocessing_mesh_bind_groups)) => replace(
+                cpu_preprocessing_mesh_bind_groups,
+                MeshPhaseBindGroups::new(&render_device),
+            ),
         };
-        cpu_preprocessing_mesh_bind_groups.reset();
-
         // In this path, we only have a single set of bind groups for all phases.
         prepare_mesh_bind_groups_for_phase(
             &mut cpu_preprocessing_mesh_bind_groups,
@@ -4044,6 +4134,7 @@ pub fn prepare_mesh_bind_groups(
             &render_morph_target_allocator,
             &render_lightmaps,
             &metadata_fallback_buffer,
+            &lightmap_pairs,
         );
 
         commands.insert_resource(MeshBindGroups::CpuPreprocessing(
@@ -4058,14 +4149,25 @@ pub fn prepare_mesh_bind_groups(
         let mut gpu_preprocessing_mesh_bind_groups = match mesh_bind_groups.as_deref_mut() {
             None | Some(MeshBindGroups::CpuPreprocessing(_)) => TypeIdHashMap::default(),
             Some(MeshBindGroups::GpuPreprocessing(gpu_preprocessing_mesh_bind_groups)) => {
-                core::mem::take(gpu_preprocessing_mesh_bind_groups)
+                take(gpu_preprocessing_mesh_bind_groups)
             }
         };
+        gpu_preprocessing_mesh_bind_groups.retain(|phase, _| {
+            gpu_batched_instance_buffers
+                .phase_instance_buffers
+                .get(phase)
+                .is_some_and(|buffers| {
+                    !buffers.data_buffer.is_empty() && buffers.instance_data_binding().is_some()
+                })
+        });
 
         // Loop over each phase.
         for (phase_type_id, batched_phase_instance_buffers) in
             &gpu_batched_instance_buffers.phase_instance_buffers
         {
+            if batched_phase_instance_buffers.data_buffer.is_empty() {
+                continue;
+            }
             let Some(instance_data_binding) =
                 batched_phase_instance_buffers.instance_data_binding()
             else {
@@ -4074,8 +4176,6 @@ pub fn prepare_mesh_bind_groups(
             let groups = gpu_preprocessing_mesh_bind_groups
                 .entry(*phase_type_id)
                 .or_insert(MeshPhaseBindGroups::new(&render_device));
-            groups.reset();
-
             prepare_mesh_bind_groups_for_phase(
                 groups,
                 instance_data_binding,
@@ -4089,12 +4189,15 @@ pub fn prepare_mesh_bind_groups(
                 &render_morph_target_allocator,
                 &render_lightmaps,
                 &metadata_fallback_buffer,
+                &lightmap_pairs,
             );
         }
 
         commands.insert_resource(MeshBindGroups::GpuPreprocessing(
             gpu_preprocessing_mesh_bind_groups,
         ));
+    } else {
+        commands.remove_resource::<MeshBindGroups>();
     }
 }
 
@@ -4112,8 +4215,10 @@ fn prepare_mesh_bind_groups_for_phase(
     render_morph_target_allocator: &RenderMorphTargetAllocator,
     render_lightmaps: &RenderLightmaps,
     metadata_fallback_buffer: &MeshMetadataFallbackBuffer,
+    lightmap_pairs: &HashSet<(MeshSlabId, LightmapSlabIndex)>,
 ) {
     let layouts = &mesh_pipeline.mesh_layouts;
+    groups.begin_frame(lightmap_pairs);
 
     for metadata_slab_id in mesh_allocator.metadata_slabs() {
         let metadata_buffer = mesh_allocator
@@ -4187,23 +4292,23 @@ fn prepare_mesh_bind_groups_for_phase(
                 }
             }
         }
+    }
 
-        // Create lightmap bindgroups. There will be one bindgroup for each slab.
-        let bindless_supported = render_lightmaps.bindless_supported;
-        for (lightmap_slab_id, lightmap_slab) in render_lightmaps.slabs.iter().enumerate() {
-            groups.lightmaps.insert(
-                (
-                    metadata_slab_id,
-                    LightmapSlabIndex(NonMaxU32::new(lightmap_slab_id as u32).unwrap()),
-                ),
-                layouts.lightmapped(
-                    render_device,
-                    pipeline_cache,
-                    &model,
-                    metadata_buffer,
-                    lightmap_slab,
-                    bindless_supported,
-                ),
+    if let BindingResource::Buffer(model) = &model {
+        for &(metadata_slab_id, lightmap_slab_id) in lightmap_pairs {
+            let lightmap_slab = &render_lightmaps.slabs[usize::from(lightmap_slab_id)];
+            let metadata_buffer = mesh_allocator
+                .buffer_for_slab(metadata_slab_id)
+                .unwrap_or(&metadata_fallback_buffer.buffer);
+            groups.prepare_lightmap(
+                (metadata_slab_id, lightmap_slab_id),
+                model,
+                metadata_buffer,
+                lightmap_slab,
+                render_lightmaps.bindless_supported,
+                layouts,
+                render_device,
+                pipeline_cache,
             );
         }
     }
@@ -4871,7 +4976,377 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMesh {
 mod tests {
     use core::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{AtomicU64ZeroBitIter, MeshPipelineKey};
+    use bevy_material::descriptor::BindGroupLayoutDescriptor;
+    use bevy_render::{
+        mesh::allocator::MeshSlabId,
+        render_resource::{
+            BufferBinding, BufferDescriptor, BufferSize, BufferUsages, Extent3d, FilterMode,
+            PipelineCache, SamplerDescriptor, ShaderStages, ShaderType, TextureDescriptor,
+            TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor, WgpuFeatures,
+        },
+        renderer::{RenderAdapter, RenderDevice, RenderInstance},
+        texture::GpuImage,
+    };
+    use bevy_tasks::block_on;
+    use wgpu_types::DeviceDescriptor;
+
+    use super::{
+        AtomicU64ZeroBitIter, MeshMorphBindGroupKey, MeshPhaseBindGroups, MeshPipelineKey,
+        MeshUniform,
+    };
+    use crate::{
+        lightmap::lightmap_slab_for_test, LightmapSlabIndex, MeshLayouts, LIGHTMAPS_PER_SLAB,
+    };
+
+    #[test]
+    #[ignore = "requires a graphics adapter"]
+    fn lightmap_bind_groups_reuse_and_invalidate_gpu_resources() {
+        let instance = RenderInstance::new(Default::default());
+        let adapter = block_on(instance.request_adapter(&Default::default()))
+            .expect("lightmap cache regression requires a graphics adapter");
+        let features = adapter.features()
+            & (WgpuFeatures::TEXTURE_BINDING_ARRAY
+                | WgpuFeatures::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING);
+        let (device, _) = block_on(adapter.request_device(&DeviceDescriptor {
+            required_features: features,
+            required_limits: adapter.limits(),
+            ..Default::default()
+        }))
+        .expect("lightmap cache device");
+        let device = RenderDevice::new(device);
+        let adapter = RenderAdapter::new(adapter);
+        let pipeline_cache = PipelineCache::new(device.clone(), true);
+        let mut layouts = MeshLayouts::new(&device, &adapter);
+        let bindless = layouts
+            .lightmapped
+            .entries
+            .iter()
+            .any(|entry| entry.count.is_some());
+        let count = if bindless { LIGHTMAPS_PER_SLAB } else { 1 };
+        let alignment = u64::from(device.limits().min_storage_buffer_offset_alignment).max(
+            u64::from(device.limits().min_uniform_buffer_offset_alignment),
+        );
+        let size = MeshUniform::min_size().get();
+        let buffer = |count| {
+            device.create_buffer(&BufferDescriptor {
+                label: Some("lightmap cache regression"),
+                size: alignment + size * count,
+                usage: BufferUsages::STORAGE | BufferUsages::UNIFORM,
+                mapped_at_creation: false,
+            })
+        };
+        let model = buffer(2);
+        let replacement_model = buffer(2);
+        let metadata = buffer(2);
+        let replacement_metadata = buffer(2);
+        let descriptor = TextureDescriptor {
+            label: Some("lightmap cache regression"),
+            size: Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        };
+        let texture = device.create_texture(&descriptor);
+        let image = GpuImage {
+            texture_view: texture.create_view(&TextureViewDescriptor::default()),
+            sampler: device.create_sampler(&SamplerDescriptor::default()),
+            texture,
+            texture_descriptor: descriptor,
+            texture_view_descriptor: None,
+            had_data: false,
+        };
+        let mut images = vec![image; count];
+        let key = (MeshSlabId::default(), LightmapSlabIndex::from(0u32));
+        let second_key = (key.0, LightmapSlabIndex::from(1u32));
+        let mut groups = MeshPhaseBindGroups::new(&device);
+        let prepare = |groups: &mut MeshPhaseBindGroups,
+                       binding: &BufferBinding,
+                       metadata,
+                       images: &[GpuImage],
+                       layouts: &MeshLayouts| {
+            let slab = lightmap_slab_for_test(images.to_vec());
+            groups.prepare_lightmap(
+                key,
+                binding,
+                metadata,
+                &slab,
+                bindless,
+                layouts,
+                &device,
+                &pipeline_cache,
+            );
+            groups
+                .get(
+                    key.0,
+                    Some(key.1),
+                    false,
+                    MeshMorphBindGroupKey::NoMorphTargets,
+                    false,
+                )
+                .expect("the current lightmapped mesh group was prepared")
+                .id()
+        };
+        let mut binding = BufferBinding {
+            buffer: &model,
+            offset: 0,
+            size: BufferSize::new(size),
+        };
+        let initial = prepare(&mut groups, &binding, &metadata, &images, &layouts);
+        groups.begin_frame(&[key].into_iter().collect());
+        assert_eq!(
+            prepare(&mut groups, &binding, &metadata, &images, &layouts),
+            initial
+        );
+
+        binding.buffer = &replacement_model;
+        let replaced = prepare(&mut groups, &binding, &metadata, &images, &layouts);
+        assert_ne!(replaced, initial, "replaced instance buffer");
+        binding.buffer = &model;
+        assert_eq!(
+            prepare(&mut groups, &binding, &metadata, &images, &layouts),
+            initial,
+            "the first buffer is reused when phase collection swaps back"
+        );
+        binding.buffer = &replacement_model;
+        assert_eq!(
+            prepare(&mut groups, &binding, &metadata, &images, &layouts),
+            replaced,
+            "the second buffer is reused on the next swap"
+        );
+
+        let grown_model = buffer(4);
+        binding.buffer = &grown_model;
+        let grown = prepare(&mut groups, &binding, &metadata, &images, &layouts);
+        assert_ne!(grown, replaced, "a grown buffer needs a new group");
+        assert_eq!(
+            groups.lightmaps[&key].len(),
+            2,
+            "growth evicts the older variant"
+        );
+        binding.buffer = &replacement_model;
+        assert_eq!(
+            prepare(&mut groups, &binding, &metadata, &images, &layouts),
+            replaced
+        );
+        binding.buffer = &model;
+        assert_ne!(
+            prepare(&mut groups, &binding, &metadata, &images, &layouts),
+            initial,
+            "the first buffer's old group was evicted after growth"
+        );
+        assert_eq!(
+            groups.lightmaps[&key].len(),
+            2,
+            "reloading an evicted variant stays bounded"
+        );
+        binding.buffer = &replacement_model;
+        assert_eq!(
+            prepare(&mut groups, &binding, &metadata, &images, &layouts),
+            replaced
+        );
+        binding.offset = alignment;
+        let offset = prepare(&mut groups, &binding, &metadata, &images, &layouts);
+        assert_ne!(offset, replaced, "changed instance binding offset");
+        binding.size = BufferSize::new(size * 2);
+        let range = prepare(&mut groups, &binding, &metadata, &images, &layouts);
+        assert_ne!(range, offset, "changed instance binding size");
+        let metadata_id = prepare(
+            &mut groups,
+            &binding,
+            &replacement_metadata,
+            &images,
+            &layouts,
+        );
+        assert_ne!(metadata_id, range, "replaced metadata buffer");
+        assert_eq!(
+            groups.lightmaps[&key].len(),
+            1,
+            "metadata replacement retires both old variants"
+        );
+
+        let mut alternate = binding.clone();
+        alternate.buffer = &model;
+        prepare(
+            &mut groups,
+            &alternate,
+            &replacement_metadata,
+            &images,
+            &layouts,
+        );
+        assert_eq!(
+            prepare(
+                &mut groups,
+                &binding,
+                &replacement_metadata,
+                &images,
+                &layouts
+            ),
+            metadata_id
+        );
+
+        images[count - 1].texture_view = images[count - 1]
+            .texture
+            .create_view(&TextureViewDescriptor::default());
+        let view = prepare(
+            &mut groups,
+            &binding,
+            &replacement_metadata,
+            &images,
+            &layouts,
+        );
+        assert_ne!(view, metadata_id, "replaced view in the last lightmap slot");
+        assert_eq!(
+            groups.lightmaps[&key].len(),
+            1,
+            "view replacement retires both old variants"
+        );
+        prepare(
+            &mut groups,
+            &alternate,
+            &replacement_metadata,
+            &images,
+            &layouts,
+        );
+        assert_eq!(
+            prepare(
+                &mut groups,
+                &binding,
+                &replacement_metadata,
+                &images,
+                &layouts
+            ),
+            view
+        );
+        images[count - 1].sampler = device.create_sampler(&SamplerDescriptor {
+            mag_filter: FilterMode::Linear,
+            ..Default::default()
+        });
+        let sampler = prepare(
+            &mut groups,
+            &binding,
+            &replacement_metadata,
+            &images,
+            &layouts,
+        );
+        assert_ne!(sampler, view, "replaced sampler in the last lightmap slot");
+        assert_eq!(
+            groups.lightmaps[&key].len(),
+            1,
+            "sampler replacement retires both old variants"
+        );
+        prepare(
+            &mut groups,
+            &alternate,
+            &replacement_metadata,
+            &images,
+            &layouts,
+        );
+        assert_eq!(
+            prepare(
+                &mut groups,
+                &binding,
+                &replacement_metadata,
+                &images,
+                &layouts
+            ),
+            sampler
+        );
+
+        let mut entries = layouts.lightmapped.entries.to_vec();
+        for entry in &mut entries {
+            entry.visibility |= ShaderStages::FRAGMENT;
+        }
+        layouts.lightmapped = BindGroupLayoutDescriptor::new("changed lightmap layout", &entries);
+        let layout = prepare(
+            &mut groups,
+            &binding,
+            &replacement_metadata,
+            &images,
+            &layouts,
+        );
+        assert_ne!(layout, sampler, "replaced binding layout");
+        assert_eq!(
+            groups.lightmaps[&key].len(),
+            1,
+            "layout replacement retires both old variants"
+        );
+
+        groups.prepare_lightmap(
+            second_key,
+            &binding,
+            &replacement_metadata,
+            &lightmap_slab_for_test(images.clone()),
+            bindless,
+            &layouts,
+            &device,
+            &pipeline_cache,
+        );
+        assert_eq!(groups.lightmaps.len(), 2);
+        groups.begin_frame(&[key].into_iter().collect());
+        assert!(
+            !groups.lightmaps.contains_key(&second_key),
+            "unused slab pair retired"
+        );
+        assert_eq!(
+            prepare(
+                &mut groups,
+                &binding,
+                &replacement_metadata,
+                &images,
+                &layouts
+            ),
+            layout
+        );
+        prepare(
+            &mut groups,
+            &alternate,
+            &replacement_metadata,
+            &images,
+            &layouts,
+        );
+        groups.begin_frame(&Default::default());
+        assert!(
+            groups.lightmaps.is_empty(),
+            "removed lightmaps release cached groups"
+        );
+        let reloaded = prepare(
+            &mut groups,
+            &binding,
+            &replacement_metadata,
+            &images,
+            &layouts,
+        );
+        assert_ne!(reloaded, layout, "reloaded slab pair creates a new group");
+        prepare(
+            &mut groups,
+            &alternate,
+            &replacement_metadata,
+            &images,
+            &layouts,
+        );
+        groups.reset();
+        assert!(
+            groups.lightmaps.is_empty(),
+            "explicit reset fully invalidates the cache"
+        );
+        assert_ne!(
+            prepare(
+                &mut groups,
+                &binding,
+                &replacement_metadata,
+                &images,
+                &layouts
+            ),
+            reloaded
+        );
+    }
 
     #[test]
     fn mesh_key_msaa_samples() {

@@ -52,7 +52,9 @@ use bevy_platform::collections::HashSet;
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::{
     render_asset::RenderAssets,
-    render_resource::{Sampler, TextureView, WgpuSampler, WgpuTextureView},
+    render_resource::{
+        Sampler, SamplerId, TextureView, TextureViewId, WgpuSampler, WgpuTextureView,
+    },
     renderer::RenderAdapter,
     sync_world::MainEntity,
     texture::{FallbackImage, GpuImage},
@@ -60,6 +62,7 @@ use bevy_render::{
 };
 use bevy_render::{renderer::RenderDevice, sync_world::MainEntityHashMap};
 use bevy_utils::default;
+use core::array::from_fn;
 use fixedbitset::FixedBitSet;
 use nonmax::{NonMaxU16, NonMaxU32};
 use tracing::error;
@@ -392,6 +395,18 @@ impl RenderLightmaps {
 }
 
 impl LightmapSlab {
+    /// Binding identities in slot order, including fallback images.
+    pub(crate) fn binding_ids(&self) -> [Option<(TextureViewId, SamplerId)>; LIGHTMAPS_PER_SLAB] {
+        from_fn(|index| {
+            self.lightmaps.get(index).map(|lightmap| {
+                (
+                    lightmap.gpu_image.texture_view.id(),
+                    lightmap.gpu_image.sampler.id(),
+                )
+            })
+        })
+    }
+
     fn new(fallback_images: &FallbackImage, bindless_supported: bool) -> LightmapSlab {
         let count = if bindless_supported {
             LIGHTMAPS_PER_SLAB
@@ -475,6 +490,21 @@ impl LightmapSlab {
 impl From<u32> for LightmapSlabIndex {
     fn from(value: u32) -> Self {
         Self(NonMaxU32::new(value).unwrap())
+    }
+}
+
+#[cfg(test)]
+/// A populated lightmap slab for GPU binding lifetime tests.
+pub(crate) fn lightmap_slab_for_test(images: Vec<GpuImage>) -> LightmapSlab {
+    LightmapSlab {
+        lightmaps: images
+            .into_iter()
+            .map(|gpu_image| AllocatedLightmap {
+                gpu_image,
+                asset_id: None,
+            })
+            .collect(),
+        free_slots_bitmask: 0,
     }
 }
 
