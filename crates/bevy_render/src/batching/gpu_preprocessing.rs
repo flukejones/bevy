@@ -25,11 +25,14 @@ use bevy_math::UVec4;
 use bevy_platform::collections::{hash_map::Entry, HashMap, HashSet};
 use bevy_tasks::ComputeTaskPool;
 use bevy_utils::{default, TypeIdHashMap};
-use bytemuck::{Pod, Zeroable};
+use bytemuck::{must_cast_slice, NoUninit, Pod, Zeroable};
 use encase::{internal::WriteInto, ShaderSize};
 use nonmax::NonMaxU32;
 use static_assertions::assert_eq_size;
-use wgpu::{BindingResource, BufferUsages, DownlevelFlags, Features};
+use wgpu::{
+    util::StagingBelt, BindingResource, BufferSize, BufferUsages, CommandEncoder,
+    CommandEncoderDescriptor, DownlevelFlags, Features,
+};
 
 use crate::{
     occlusion_culling::OcclusionCulling,
@@ -45,7 +48,10 @@ use crate::{
         PartialBufferVec, PipelineCache, RawBufferVec, SparseBufferUpdateBindGroups,
         SparseBufferUpdateJobs, SparseBufferUpdatePipelines, UninitBufferVec,
     },
-    renderer::{RenderAdapter, RenderAdapterInfo, RenderDevice, RenderQueue},
+    renderer::{
+        wgpu_wrapper, PendingCommandBuffers, RenderAdapter, RenderAdapterInfo, RenderDevice,
+        RenderQueue,
+    },
     sync_world::{MainEntity, MainEntityHashMap},
     view::{ExtractedView, NoIndirectDrawing, RetainedViewEntity},
     GpuResourceAppExt, Render, RenderApp, RenderDebugFlags, RenderSystems,
@@ -74,6 +80,7 @@ impl Plugin for BatchingPlugin {
             .init_gpu_resource::<IndirectParametersBuffers>()
             .allow_ambiguous_resource::<IndirectParametersBuffers>()
             .init_gpu_resource::<SceneUnpackingBuffers>()
+            .init_gpu_resource::<BinnedInstanceBufferUploads>()
             .init_gpu_resource::<IndirectParametersBuildJobs>()
             .init_gpu_resource::<BuildIndirectParametersMetadata>()
             .add_systems(
@@ -2833,16 +2840,85 @@ pub fn write_batched_instance_buffers<GFBD>(
     );
 }
 
+const BINNED_INSTANCE_UPLOAD_CHUNK_SIZE: u64 = 1024 * 1024;
+
+wgpu_wrapper!(struct WgpuBinnedInstanceStagingBelt(StagingBelt));
+
+/// Reusable staging storage and CPU scratch for binned instance uploads.
+///
+/// Copy encoders must be enqueued before their render-graph consumers. Staging
+/// chunks return to the pool after GPU completion; device recovery resets the pool.
+#[derive(Resource)]
+pub struct BinnedInstanceBufferUploads {
+    staging_belt: WgpuBinnedInstanceStagingBelt,
+    seen_views: HashSet<RetainedViewEntity>,
+    metadata: MainEntityHashMap<BatchSetSceneUnpackingMetadata>,
+}
+
+impl FromWorld for BinnedInstanceBufferUploads {
+    fn from_world(world: &mut World) -> Self {
+        let device = world.resource::<RenderDevice>().wgpu_device().clone();
+        Self {
+            staging_belt: WgpuBinnedInstanceStagingBelt::new(StagingBelt::new(
+                device,
+                BINNED_INSTANCE_UPLOAD_CHUNK_SIZE,
+            )),
+            seen_views: HashSet::default(),
+            metadata: MainEntityHashMap::default(),
+        }
+    }
+}
+
+impl BinnedInstanceBufferUploads {
+    fn write<T: NoUninit>(
+        &mut self,
+        values: &mut RawBufferVec<T>,
+        device: &RenderDevice,
+        encoder: &mut Option<CommandEncoder>,
+    ) {
+        if values.is_empty() {
+            return;
+        }
+        values.reserve(values.len(), device);
+        let bytes: &[u8] = must_cast_slice(values.values());
+        let Some(size) = BufferSize::new(bytes.len() as u64) else {
+            return;
+        };
+        let encoder = encoder.get_or_insert_with(|| {
+            device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("binned instance buffer uploads"),
+            })
+        });
+        self.staging_belt
+            .write_buffer(
+                encoder,
+                values.buffer().expect("nonempty bin buffer was reserved"),
+                0,
+                size,
+            )
+            .copy_from_slice(bytes);
+    }
+
+    fn finish(&mut self, encoder: Option<CommandEncoder>, pending: &mut PendingCommandBuffers) {
+        if let Some(encoder) = encoder {
+            self.staging_belt.finish_and_recall_on_submit(&encoder);
+            pending.push_encoder(encoder, "binned instance buffer uploads");
+        }
+    }
+}
+
 /// Writes the bin data for each render phase to the GPU.
 ///
 /// The bin data consists of the IDs of the mesh instances, as well as the
 /// metadata needed for the `unpack_bins` shader to unpack them.
+/// Upload commands precede render-graph consumers in [`PendingCommandBuffers`].
 pub fn write_binned_instance_buffers<BPI, GFBD>(
     mut views: Query<&ExtractedView>,
     mut view_binned_render_phases: ResMut<ViewBinnedRenderPhases<BPI>>,
     bin_unpacking_buffers: ResMut<SceneUnpackingBuffers>,
     render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
+    mut uploads: ResMut<BinnedInstanceBufferUploads>,
+    mut pending_commands: ResMut<PendingCommandBuffers>,
 ) where
     BPI: BinnedPhaseItem,
     GFBD: GetFullBatchData,
@@ -2851,12 +2927,13 @@ pub fn write_binned_instance_buffers<BPI, GFBD>(
 
     let phase_type_id = TypeId::of::<BPI>();
 
-    // Record all the `RetainedViewEntity` keys that we saw so that we can
-    // delete buffers corresponding to views that went away.
-    let mut all_seen_view_entities = HashSet::new();
+    uploads.seen_views.clear();
+    let mut encoder = None;
 
     for extracted_view in &mut views {
-        all_seen_view_entities.insert(extracted_view.retained_view_entity);
+        uploads
+            .seen_views
+            .insert(extracted_view.retained_view_entity);
 
         let Some(view_binned_render_phase) =
             view_binned_render_phases.get_mut(&extracted_view.retained_view_entity)
@@ -2900,8 +2977,8 @@ pub fn write_binned_instance_buffers<BPI, GFBD>(
         // We use the *representative entity* as the key for the later loop to
         // find the `BatchSetBinUnpackingMetadata`, because it's a unique value
         // that can be fetched from the `BinnedRenderPhaseBatchSet`.
-        let mut representative_entity_to_batch_set_scene_unpacking_metadata =
-            MainEntityHashMap::default();
+        uploads.metadata.clear();
+        uploads.metadata.reserve(batch_sets.len());
 
         for batch_set in batch_sets {
             let main_entity = batch_set.first_batch.representative_entity.1;
@@ -2913,7 +2990,7 @@ pub fn write_binned_instance_buffers<BPI, GFBD>(
             {
                 // Record the batch set bin unpacking metadata for later passes
                 // to use.
-                representative_entity_to_batch_set_scene_unpacking_metadata.insert(
+                uploads.metadata.insert(
                     main_entity,
                     BatchSetSceneUnpackingMetadata {
                         base_output_work_item_index: batch_set.first_work_item_index,
@@ -2936,30 +3013,32 @@ pub fn write_binned_instance_buffers<BPI, GFBD>(
                 continue;
             };
             let Some(scene_unpacking_metadata) =
-                representative_entity_to_batch_set_scene_unpacking_metadata
-                    .get(&representative_entity)
+                uploads.metadata.get(&representative_entity).copied()
             else {
                 continue;
             };
 
             // Write the various buffers to the GPU.
 
-            batch_set
-                .gpu_buffers
-                .render_binned_mesh_instance_buffer
-                .write_buffer(&render_device, &render_queue);
-            batch_set
-                .gpu_buffers
-                .bin_metadata_buffer
-                .write_buffer(&render_device, &render_queue);
+            uploads.write(
+                &mut batch_set.gpu_buffers.render_binned_mesh_instance_buffer,
+                &render_device,
+                &mut encoder,
+            );
+            uploads.write(
+                &mut batch_set.gpu_buffers.bin_metadata_buffer,
+                &render_device,
+                &mut encoder,
+            );
             batch_set
                 .gpu_buffers
                 .fan_buffer
                 .write_buffer(&render_device);
-            batch_set
-                .gpu_buffers
-                .bin_index_to_bin_metadata_index_buffer
-                .write_buffer(&render_device, &render_queue);
+            uploads.write(
+                &mut batch_set.gpu_buffers.bin_index_to_bin_metadata_index_buffer,
+                &render_device,
+                &mut encoder,
+            );
 
             let (
                 Some(render_bin_entry_buffer),
@@ -3058,8 +3137,9 @@ pub fn write_binned_instance_buffers<BPI, GFBD>(
         .view_phase_buffers
         .retain(|bin_unpacking_buffers_key, _| {
             bin_unpacking_buffers_key.phase != phase_type_id
-                || all_seen_view_entities.contains(&bin_unpacking_buffers_key.view)
+                || uploads.seen_views.contains(&bin_unpacking_buffers_key.view)
         });
+    uploads.finish(encoder, &mut pending_commands);
 }
 
 /// Clears out the [`SceneUnpackingBuffers`] in preparation for a new frame.
@@ -3070,6 +3150,7 @@ pub fn clear_scene_unpacking_buffers(mut scene_unpacking_buffers: ResMut<SceneUn
 
 /// CPU-side metadata needed to drive the uniform allocation and bin unpacking
 /// compute shaders for a single batch set.
+#[derive(Clone, Copy)]
 struct BatchSetSceneUnpackingMetadata {
     /// The index of the first [`PreprocessWorkItem`] that the compute shader
     /// dispatch is to write to.
@@ -3194,5 +3275,130 @@ mod tests {
 
         instance_buffer.add(TestData(5));
         assert_eq!(instance_buffer.buffer().len(), 1);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod gpu_uploads {
+        use core::array;
+        use std::{sync::mpsc, time::Duration};
+
+        use bevy_platform::future::block_on;
+        use bevy_tasks::TaskPool;
+        use bytemuck::cast_slice;
+        use wgpu::{
+            BufferDescriptor, DeviceDescriptor, Instance, MapMode, PollType, RequestAdapterOptions,
+        };
+
+        use super::*;
+
+        #[test]
+        #[ignore = "requires a GPU adapter"]
+        fn binned_uploads_preserve_order_and_in_flight_ownership() {
+            ComputeTaskPool::get_or_init(TaskPool::new);
+            let instance = Instance::default();
+            let adapter = block_on(instance.request_adapter(&RequestAdapterOptions::default()))
+                .expect("a GPU adapter is required");
+            let (device, queue) = block_on(adapter.request_device(&DeviceDescriptor::default()))
+                .expect("the GPU adapter must provide a device");
+            let device = RenderDevice::from(device);
+            let mut world = World::new();
+            world.insert_resource(device.clone());
+            let mut uploads = BinnedInstanceBufferUploads::from_world(&mut world);
+            let mut pending = PendingCommandBuffers::default();
+            let mut buffers = array::from_fn::<_, 6, _>(|_| {
+                RawBufferVec::<u32>::new(BufferUsages::STORAGE | BufferUsages::COPY_SRC)
+            });
+            let frames: [[&[u32]; 6]; 3] = [
+                [&[11, 12], &[21], &[31, 32, 33], &[41, 42], &[51], &[61, 62]],
+                [
+                    &[111, 112, 113, 114, 115],
+                    &[],
+                    &[131],
+                    &[141],
+                    &[151, 152, 153],
+                    &[161, 162, 163, 164],
+                ],
+                [&[211], &[221, 222], &[], &[241, 242, 243], &[251], &[261]],
+            ];
+            let expected_frames: [&[u32]; 3] = [
+                &[0, 12, 0, 0, 32, 33, 0, 42, 0, 0, 62],
+                &[0, 112, 113, 114, 115, 0, 0, 0, 152, 153, 0, 162, 163, 164],
+                &[0, 0, 222, 0, 242, 243, 0, 0],
+            ];
+            let mut readbacks = Vec::with_capacity(frames.len());
+
+            for (frame, records) in frames.into_iter().enumerate() {
+                for (buffer, records) in buffers.iter_mut().zip(records) {
+                    buffer.clear();
+                    buffer.values_mut().extend_from_slice(records);
+                }
+                for phase in buffers.chunks_mut(3) {
+                    let mut encoder = None;
+                    for buffer in phase {
+                        uploads.write(buffer, &device, &mut encoder);
+                    }
+                    uploads.finish(encoder, &mut pending);
+                }
+
+                let byte_count = buffers.iter().map(|buffer| buffer.len() as u64 * 4).sum();
+                let readback = device.create_buffer(&BufferDescriptor {
+                    label: Some("binned upload regression readback"),
+                    size: byte_count,
+                    usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                let mut consumer = device.create_command_encoder(&CommandEncoderDescriptor {
+                    label: Some("binned upload regression consumer"),
+                });
+                let mut offset = 0;
+                for buffer in &buffers {
+                    if buffer.is_empty() {
+                        continue;
+                    }
+                    let source = buffer.buffer().expect("nonempty buffer was uploaded");
+                    let size = buffer.len() as u64 * 4;
+                    consumer.clear_buffer(source, 0, Some(4));
+                    consumer.copy_buffer_to_buffer(source, 0, &readback, offset, size);
+                    offset += size;
+                }
+                let (sender, receiver) = mpsc::channel();
+                consumer.map_buffer_on_submit(&readback, MapMode::Read, .., move |result| {
+                    sender
+                        .send(result)
+                        .expect("the readback receiver remains alive until completion");
+                });
+                pending.push_encoder(consumer, "binned upload regression consumer");
+                queue.submit(pending.finish());
+                readbacks.push((readback, receiver));
+
+                if frame == 1 {
+                    drop(uploads);
+                    uploads = BinnedInstanceBufferUploads::from_world(&mut world);
+                }
+            }
+            drop(uploads);
+            drop(buffers);
+            device
+                .poll(PollType::Wait {
+                    submission_index: None,
+                    timeout: Some(Duration::from_secs(10)),
+                })
+                .expect("queued uploads and consumers must complete");
+
+            for ((readback, receiver), expected) in readbacks.into_iter().zip(expected_frames) {
+                receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("the mapping callback must complete")
+                    .expect("the readback must map successfully");
+                let mapped = readback
+                    .slice(..)
+                    .get_mapped_range()
+                    .expect("the complete readback range was mapped");
+                let actual: &[u32] = cast_slice(&mapped);
+                assert_eq!(actual, expected);
+                drop(mapped);
+                readback.unmap();
+            }
+        }
     }
 }
