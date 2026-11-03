@@ -25,7 +25,7 @@ use bevy_math::UVec4;
 use bevy_platform::collections::{hash_map::Entry, HashMap, HashSet};
 use bevy_tasks::ComputeTaskPool;
 use bevy_utils::{default, TypeIdHashMap};
-use bytemuck::{must_cast_slice, NoUninit, Pod, Zeroable};
+use bytemuck::{NoUninit, Pod, Zeroable};
 use encase::{internal::WriteInto, ShaderSize};
 use nonmax::NonMaxU32;
 use static_assertions::assert_eq_size;
@@ -2822,27 +2822,17 @@ impl BinnedInstanceBufferUploads {
         device: &RenderDevice,
         encoder: &mut Option<CommandEncoder>,
     ) {
-        if values.is_empty() {
-            return;
-        }
-        values.reserve(values.len(), device);
-        let bytes: &[u8] = must_cast_slice(values.values());
-        let Some(size) = BufferSize::new(bytes.len() as u64) else {
-            return;
-        };
-        let encoder = encoder.get_or_insert_with(|| {
-            device.create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("binned instance buffer uploads"),
-            })
+        values.write_buffer_if_changed(device, |buffer, bytes| {
+            let size = BufferSize::new(bytes.len() as u64).expect("nonempty bin upload");
+            let encoder = encoder.get_or_insert_with(|| {
+                device.create_command_encoder(&CommandEncoderDescriptor {
+                    label: Some("binned instance buffer uploads"),
+                })
+            });
+            self.staging_belt
+                .write_buffer(encoder, buffer, 0, size)
+                .copy_from_slice(bytes);
         });
-        self.staging_belt
-            .write_buffer(
-                encoder,
-                values.buffer().expect("nonempty bin buffer was reserved"),
-                0,
-                size,
-            )
-            .copy_from_slice(bytes);
     }
 
     fn finish(&mut self, encoder: Option<CommandEncoder>, pending: &mut PendingCommandBuffers) {
@@ -3265,6 +3255,15 @@ mod tests {
                     }
                     uploads.finish(encoder, &mut pending);
                 }
+
+                let mut unchanged = None;
+                for buffer in &mut buffers {
+                    uploads.write(buffer, &device, &mut unchanged);
+                }
+                assert!(
+                    unchanged.is_none(),
+                    "unchanged bins recorded upload commands"
+                );
 
                 let byte_count = buffers.iter().map(|buffer| buffer.len() as u64 * 4).sum();
                 let readback = device.create_buffer(&BufferDescriptor {
