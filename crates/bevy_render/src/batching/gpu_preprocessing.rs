@@ -2944,14 +2944,15 @@ pub fn write_binned_instance_buffers<BPI, GFBD>(
 
             // Write the various buffers to the GPU.
 
+            let write = |buffer: &Buffer, bytes: &[u8]| render_queue.write_buffer(buffer, 0, bytes);
             batch_set
                 .gpu_buffers
                 .render_binned_mesh_instance_buffer
-                .write_buffer(&render_device, &render_queue);
+                .write_buffer_if_changed(&render_device, write);
             batch_set
                 .gpu_buffers
                 .bin_metadata_buffer
-                .write_buffer(&render_device, &render_queue);
+                .write_buffer_if_changed(&render_device, write);
             batch_set
                 .gpu_buffers
                 .fan_buffer
@@ -2959,7 +2960,7 @@ pub fn write_binned_instance_buffers<BPI, GFBD>(
             batch_set
                 .gpu_buffers
                 .bin_index_to_bin_metadata_index_buffer
-                .write_buffer(&render_device, &render_queue);
+                .write_buffer_if_changed(&render_device, write);
 
             let (
                 Some(render_bin_entry_buffer),
