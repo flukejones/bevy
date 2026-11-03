@@ -1,8 +1,10 @@
 //! Batching functionality when GPU preprocessing is in use.
 
-use alloc::sync::Arc;
+use alloc::{borrow::Cow, sync::Arc};
 use core::{
     any::TypeId,
+    cell::Cell,
+    iter,
     marker::PhantomData,
     mem,
     ops::Range,
@@ -25,11 +27,13 @@ use bevy_math::UVec4;
 use bevy_platform::collections::{hash_map::Entry, HashMap, HashSet};
 use bevy_tasks::ComputeTaskPool;
 use bevy_utils::{default, TypeIdHashMap};
-use bytemuck::{Pod, Zeroable};
+use bytemuck::{cast_slice, Pod, Zeroable};
 use encase::{internal::WriteInto, ShaderSize};
 use nonmax::NonMaxU32;
 use static_assertions::assert_eq_size;
-use wgpu::{BindingResource, BufferUsages, DownlevelFlags, Features};
+use wgpu::{
+    BindingResource, BufferSize, BufferUsages, DownlevelFlags, Features, Limits, WriteOnly,
+};
 
 use crate::{
     occlusion_culling::OcclusionCulling,
@@ -37,15 +41,17 @@ use crate::{
         BinnedPhaseItem, BinnedRenderPhaseBatch, BinnedRenderPhaseBatchSet,
         BinnedRenderPhaseBatchSets, CachedRenderPipelinePhaseItem, PhaseItem,
         PhaseItemBatchSetKey as _, PhaseItemExtraIndex, RenderMultidrawableBatchSet,
-        SortedPhaseItem, SortedRenderPhase, UnbatchableBinnedEntityIndices, ViewBinnedRenderPhases,
-        ViewSortedRenderPhases,
+        RenderMultidrawableBatchSetSource, SceneUnpackingSourceId, SortedPhaseItem,
+        SortedRenderPhase, UnbatchableBinnedEntityIndices, ViewBinnedRenderPhases,
+        ViewSortedRenderPhases, UNIFORM_ALLOCATION_WORKGROUP_SIZE,
     },
     render_resource::{
-        AtomicPod, AtomicRawBufferVec, AtomicSparseBufferVec, Buffer, GpuArrayBufferable,
+        AtomicPod, AtomicRawBufferVec, AtomicSparseBufferVec, Buffer, BufferId, GpuArrayBufferable,
         PartialBufferVec, PipelineCache, RawBufferVec, SparseBufferUpdateBindGroups,
         SparseBufferUpdateJobs, SparseBufferUpdatePipelines, UninitBufferVec,
     },
     renderer::{RenderAdapter, RenderAdapterInfo, RenderDevice, RenderQueue},
+    slab_allocator::{SlabAllocator, SlabAllocatorSettings, SlabItem, SlabItemLayout},
     sync_world::{MainEntity, MainEntityHashMap},
     view::{ExtractedView, NoIndirectDrawing, RetainedViewEntity},
     GpuResourceAppExt, Render, RenderApp, RenderDebugFlags, RenderSystems,
@@ -1074,7 +1080,7 @@ pub struct GpuBinMetadata {
 }
 
 /// Per-frame ranges for allocating mesh uniforms and unpacking a cached batch set.
-/// The record is padded to 256 bytes for uniform-buffer offsets.
+/// Dispatches bind a fixed block of these records at a dynamic uniform offset.
 #[derive(Clone, Copy, Pod, Zeroable, ShaderType)]
 #[repr(C)]
 pub struct GpuSceneUnpackingMetadata {
@@ -1101,40 +1107,33 @@ pub struct GpuSceneUnpackingMetadata {
     pub base_indirect_parameters_index: u32,
     /// The number of cached mesh instances to unpack, independently of the bin count.
     pub binned_mesh_instance_count: u32,
-    /// Padding to the uniform-buffer offset alignment.
-    pub pad: [u32; 57],
+    /// Absolute word offset of this batch set's live source allocation.
+    pub source_base: u32,
+    /// Word offset of the instance table within the allocation at `source_base`.
+    pub source_instance_offset: u32,
+    /// Word offset of the sparse bin map within the allocation at `source_base`.
+    pub source_bin_map_offset: u32,
+    /// First scratch word used by this batch set's allocation scan.
+    pub fan_base: u32,
+    /// Instance chunk of 256 lanes handled by a grouped-dispatch workgroup.
+    pub chunk_index: u32,
+    /// Padding to a 64-byte record.
+    pub pad: [u32; 4],
 }
 
-/// Cached buffers and current-frame ranges for unpacking one batch set.
-/// Buffer handles retain their allocations through GPU submission.
+/// Maximum number of independently described workgroups in one dispatch.
+pub const SCENE_UNPACKING_WORKGROUPS_PER_DISPATCH: usize = 256;
+
+/// Retained source storage and current-frame descriptors for one dispatch.
 pub struct SceneUnpackingJob {
-    /// The GPU buffer of `GpuRenderBinnedMeshInstance`s corresponding to the
-    /// mesh instances that this batch set contains.
-    ///
-    /// This is used in the `unpack_scene` shader.
-    pub render_binned_mesh_instance_buffer: Buffer,
-    /// The GPU buffer that stores various metadata for each bin, including the
-    /// indirect parameters offset and the instance count.
-    ///
-    /// The local scan and instance unpacking read the same cached metadata.
-    pub bin_metadata_buffer: Buffer,
-    /// A temporary GPU buffer that stores the mesh uniform index of the last
-    /// instance plus one for each workgroup (i.e. for each 256-bin chunk).
-    ///
-    /// This is accumulated in the second stage of the `unpack_scene`
-    /// shader and written out in the third.
-    pub fan_buffer: Buffer,
-    /// A GPU buffer that maps the stable index of each bin to the index of the
-    /// metadata in the [`Self::bin_metadata_buffer`].
-    pub bin_index_to_bin_metadata_index_buffer: Buffer,
-    /// The index of this batch set's [`GpuSceneUnpackingMetadata`] in the
-    /// [`SceneUnpackingBuffers::metadata`] buffer.
+    /// Packed source words retained through GPU submission.
+    pub source_buffer: Buffer,
+    /// First descriptor in the fixed-size uniform block.
     pub metadata_index: SceneUnpackingMetadataIndex,
-    /// The total number of mesh instances in this batch set.
-    pub mesh_instance_count: u32,
-    /// The total number of bins (i.e. draws, i.e. separate meshes) in this
-    /// batch set.
-    pub bin_count: u32,
+    /// Number of workgroups to dispatch.
+    pub workgroup_count: u32,
+    /// Number of bin-scan workgroups; values above one require the global scan.
+    pub bin_workgroup_count: u32,
 }
 
 /// The buffers containing all the information that indirect draw commands use
@@ -1310,21 +1309,136 @@ impl UntypedPhaseIndirectParametersBuffers {
 /// the scene-unpacking shader and allocation scan passes.
 #[derive(Resource)]
 pub struct SceneUnpackingBuffers {
-    /// Per-frame ranges for each batch set, padded for uniform-buffer offsets.
+    /// Current-frame descriptor blocks, padded to dynamic uniform offsets.
     pub metadata: RawBufferVec<GpuSceneUnpackingMetadata>,
-    /// Per-view-phase buffers for the bin unpacking shader.
+    /// Shared current-frame scratch for scans spanning multiple workgroups.
+    pub fan_buffer: UninitBufferVec<u32>,
+    /// Current-frame dispatches for each view and render phase.
     pub view_phase_buffers: HashMap<SceneUnpackingBuffersKey, ViewPhaseSceneUnpackingBuffers>,
+    sources: SlabAllocator<SceneSource>,
+    source_settings: SlabAllocatorSettings,
+    source_allocations: HashMap<SceneUnpackingSourceId, SceneSourceAllocation>,
+    seen_sources: HashSet<SceneUnpackingSourceId>,
+    seen_view_phases: HashSet<SceneUnpackingBuffersKey>,
+    batch_metadata: MainEntityHashMap<BatchSetSceneUnpackingMetadata>,
+    open_groups: HashMap<(BufferId, bool), OpenSceneUnpackingGroup>,
 }
 
-impl Default for SceneUnpackingBuffers {
-    fn default() -> Self {
+impl FromWorld for SceneUnpackingBuffers {
+    fn from_world(world: &mut World) -> Self {
+        let limits = world.resource::<RenderDevice>().limits();
+        let max_slab_size = limits
+            .max_buffer_size
+            .min(limits.max_storage_buffer_binding_size)
+            .min(u64::from(u32::MAX) * size_of::<u32>() as u64);
+        let defaults = SlabAllocatorSettings::default();
+        let source_settings = SlabAllocatorSettings {
+            min_slab_size: defaults.min_slab_size.min(max_slab_size),
+            max_slab_size,
+            large_threshold: defaults.large_threshold.min(max_slab_size),
+            growth_factor: defaults.growth_factor,
+        };
         let mut metadata = RawBufferVec::new(BufferUsages::UNIFORM);
-        metadata.set_label(Some("scene unpacking metadata buffer"));
-        SceneUnpackingBuffers {
+        metadata.set_label(Some("scene unpacking descriptor blocks"));
+        let mut fan_buffer = UninitBufferVec::new(BufferUsages::STORAGE);
+        fan_buffer.set_label(Some("scene unpacking scan scratch"));
+        Self {
             metadata,
+            fan_buffer,
             view_phase_buffers: HashMap::default(),
+            sources: SlabAllocator::new(),
+            source_settings,
+            source_allocations: HashMap::default(),
+            seen_sources: HashSet::default(),
+            seen_view_phases: HashSet::default(),
+            batch_metadata: MainEntityHashMap::default(),
+            open_groups: HashMap::default(),
         }
     }
+}
+
+impl SceneUnpackingBuffers {
+    fn retire_unused(&mut self) {
+        let Self {
+            sources,
+            source_allocations,
+            seen_sources,
+            view_phase_buffers,
+            seen_view_phases,
+            ..
+        } = self;
+        let mut retirement = sources.stage_deallocation();
+        source_allocations.retain(|id, _| {
+            if seen_sources.contains(id) {
+                true
+            } else {
+                retirement.free(id);
+                false
+            }
+        });
+        retirement.commit();
+        view_phase_buffers.retain(|key, _| seen_view_phases.contains(key));
+    }
+}
+
+struct SceneSource;
+
+impl SlabItem for SceneSource {
+    type Key = SceneUnpackingSourceId;
+    type Layout = SceneSourceLayout;
+
+    fn label() -> Cow<'static, str> {
+        "scene unpacking source".into()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct SceneSourceLayout;
+
+impl SlabItemLayout for SceneSourceLayout {
+    fn size(&self) -> u64 {
+        size_of::<u32>() as u64
+    }
+
+    fn elements_per_slot(&self) -> u32 {
+        1
+    }
+
+    fn buffer_usages(&self) -> BufferUsages {
+        BufferUsages::STORAGE | BufferUsages::COPY_SRC
+    }
+}
+
+struct SceneSourceAllocation {
+    /// Resident capacity follows the actual slice; dedicated slabs ignore spare reservation.
+    capacity_words: u32,
+    pending: bool,
+}
+
+struct OpenSceneUnpackingGroup {
+    job_index: usize,
+    metadata_base: u32,
+    count: u32,
+}
+
+fn source_word_count(source: &RenderMultidrawableBatchSetSource) -> Option<u32> {
+    let bytes = size_of_val(source.bins.as_slice())
+        .checked_add(size_of_val(source.instances.as_slice()))?
+        .checked_add(size_of_val(source.bin_map.as_slice()))?;
+    u32::try_from(bytes / size_of::<u32>()).ok()
+}
+
+fn copy_source_data(source: &RenderMultidrawableBatchSetSource, mut output: WriteOnly<[u8]>) {
+    let bins = cast_slice(&source.bins);
+    let instances = cast_slice(&source.instances);
+    let map = cast_slice(&source.bin_map);
+    output.slice(..bins.len()).copy_from_slice(bins);
+    output
+        .slice(bins.len()..bins.len() + instances.len())
+        .copy_from_slice(instances);
+    output
+        .slice(bins.len() + instances.len()..bins.len() + instances.len() + map.len())
+        .copy_from_slice(map);
 }
 
 /// GPU buffers for the bin unpacking shader that are specific to each phase of
@@ -2693,6 +2807,10 @@ pub fn write_batched_instance_buffers<GFBD>(
     let render_queue = &*render_queue;
 
     let scene_unpacking_buffers = &mut *scene_unpacking_buffers;
+    scene_unpacking_buffers.retire_unused();
+    scene_unpacking_buffers
+        .fan_buffer
+        .write_buffer(render_device);
 
     ComputeTaskPool::get().scope(|scope| {
         scope.spawn(async {
@@ -2779,76 +2897,105 @@ pub fn write_batched_instance_buffers<GFBD>(
     );
 }
 
-/// Writes the bin data for each render phase to the GPU.
-///
-/// The bin data consists of the IDs of the mesh instances, as well as the
-/// metadata needed for the `unpack_scene` shader to unpack them.
-pub fn write_binned_instance_buffers<BPI, GFBD>(
-    mut views: Query<&ExtractedView>,
+/// Uploads changed source tables and groups scene-unpacking work by shared storage.
+/// Allocation growth finishes before dispatches retain the current backing buffers.
+/// Panics on unsupported capacity: partially initialized mesh ranges cannot be submitted.
+pub fn write_binned_instance_buffers<BPI>(
+    views: Query<&ExtractedView>,
     mut view_binned_render_phases: ResMut<ViewBinnedRenderPhases<BPI>>,
     scene_unpacking_buffers: ResMut<SceneUnpackingBuffers>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
 ) where
     BPI: BinnedPhaseItem,
-    GFBD: GetFullBatchData,
 {
-    let scene_unpacking_buffers = scene_unpacking_buffers.into_inner();
+    let limits = render_device.limits();
+    let SceneUnpackingBuffers {
+        metadata,
+        fan_buffer,
+        view_phase_buffers,
+        sources,
+        source_settings,
+        source_allocations,
+        seen_sources,
+        seen_view_phases,
+        batch_metadata,
+        open_groups,
+    } = scene_unpacking_buffers.into_inner();
+    let phase = TypeId::of::<BPI>();
+    let max_source_words = source_settings.max_slab_size / size_of::<u32>() as u64;
 
-    let phase_type_id = TypeId::of::<BPI>();
+    let mut allocations = sources.stage_allocation();
+    for view in &views {
+        let Some(render_phase) = view_binned_render_phases.get(&view.retained_view_entity) else {
+            continue;
+        };
+        if !matches!(
+            render_phase.batch_sets,
+            BinnedRenderPhaseBatchSets::MultidrawIndirect(_)
+        ) {
+            continue;
+        }
+        for batch_set in render_phase.multidrawable_meshes.values() {
+            let source = &batch_set.source;
+            if source.instances.is_empty() || source.bins.is_empty() {
+                continue;
+            }
+            let words = source_word_count(source).unwrap_or_else(|| {
+                panic!(
+                    "Scene-unpacking source {:?} exceeds the u32 word address space",
+                    source.id
+                );
+            });
+            assert!(
+                u64::from(words) <= max_source_words,
+                "Scene-unpacking source {:?} requests {words} words; the device limit is {max_source_words} words",
+                source.id,
+            );
+            seen_sources.insert(source.id);
+            let allocation = source_allocations
+                .entry(source.id)
+                .or_insert(SceneSourceAllocation {
+                    capacity_words: 0,
+                    pending: false,
+                });
+            if words <= allocation.capacity_words {
+                continue;
+            }
+            let capacity_words = words
+                .checked_next_power_of_two()
+                .filter(|&capacity| u64::from(capacity) <= max_source_words)
+                .unwrap_or(words);
+            allocations.allocate(
+                &source.id,
+                u64::from(capacity_words) * size_of::<u32>() as u64,
+                SceneSourceLayout,
+                source_settings,
+            );
+            allocation.capacity_words = capacity_words;
+            allocation.pending = true;
+        }
+    }
+    allocations.commit(&render_device, &render_queue);
+    sources.clear_displaced_keys();
 
-    // Record all the `RetainedViewEntity` keys that we saw so that we can
-    // delete buffers corresponding to views that went away.
-    let mut all_seen_view_entities = HashSet::new();
-
-    for extracted_view in &mut views {
-        all_seen_view_entities.insert(extracted_view.retained_view_entity);
-
-        let Some(view_binned_render_phase) =
-            view_binned_render_phases.get_mut(&extracted_view.retained_view_entity)
+    for view in &views {
+        let Some(render_phase) = view_binned_render_phases.get_mut(&view.retained_view_entity)
         else {
             continue;
         };
-
-        // Since we currently only perform GPU-side bin unpacking for multidrawn
-        // batch sets, we bail out for all other types of batch sets.
-        let BinnedRenderPhaseBatchSets::MultidrawIndirect(ref batch_sets) =
-            view_binned_render_phase.batch_sets
+        let BinnedRenderPhaseBatchSets::MultidrawIndirect(ref batch_sets) = render_phase.batch_sets
         else {
             continue;
         };
-
-        // Get or create the bin unpacking buffers for this (view, phase)
-        // combination.
-        let view_phase_scene_unpacking_buffers = scene_unpacking_buffers
-            .view_phase_buffers
-            .entry(SceneUnpackingBuffersKey {
-                phase: phase_type_id,
-                view: extracted_view.retained_view_entity,
-            })
-            .or_default();
-
-        // Clear out the list of jobs.
-        view_phase_scene_unpacking_buffers
-            .indexed_unpacking_jobs
-            .clear();
-        view_phase_scene_unpacking_buffers
-            .non_indexed_unpacking_jobs
-            .clear();
-
-        // Our goal is to extract the output work item location and indirect
-        // parameters info from the flat `batch_sets` list and to use it to
-        // build each batch set's `GpuSceneUnpackingMetadata`. To do that, we
-        // first loop over each batch set in the `batch_set` list and add the
-        // extracted entry to the
-        // `representative_entity_to_batch_set_scene_unpacking_metadata` table.
-
-        // We use the *representative entity* as the key for the later loop to
-        // find the `BatchSetSceneUnpackingMetadata`, because it's a unique value
-        // that can be fetched from the `BinnedRenderPhaseBatchSet`.
-        let mut representative_entity_to_batch_set_scene_unpacking_metadata =
-            MainEntityHashMap::default();
-
+        let key = SceneUnpackingBuffersKey {
+            phase,
+            view: view.retained_view_entity,
+        };
+        seen_view_phases.insert(key);
+        let jobs = view_phase_buffers.entry(key).or_default();
+        batch_metadata.clear();
+        open_groups.clear();
         for batch_set in batch_sets {
             let main_entity = batch_set.first_batch.representative_entity.1;
             if *main_entity != Entity::PLACEHOLDER
@@ -2857,9 +3004,7 @@ pub fn write_binned_instance_buffers<BPI, GFBD>(
                     ..
                 } = batch_set.first_batch.extra_index
             {
-                // Record the batch set bin unpacking metadata for later passes
-                // to use.
-                representative_entity_to_batch_set_scene_unpacking_metadata.insert(
+                batch_metadata.insert(
                     main_entity,
                     BatchSetSceneUnpackingMetadata {
                         base_output_work_item_index: batch_set.first_work_item_index,
@@ -2871,128 +3016,244 @@ pub fn write_binned_instance_buffers<BPI, GFBD>(
                 );
             }
         }
-
-        // Now loop over all the batch sets in the phase. Look up the
-        // corresponding `BatchSetSceneUnpackingMetadata`, and use it to prepare
-        // the `GpuSceneUnpackingMetadata` and the `SceneUnpackingJob`s. Also, kick
-        // off writes for all the associated GPU buffers that we'd been building
-        // up in earlier phases.
-        for (batch_set_key, batch_set) in view_binned_render_phase.multidrawable_meshes.iter_mut() {
-            let Some(representative_entity) = batch_set.representative_entity() else {
+        for (batch_set_key, batch_set) in render_phase.multidrawable_meshes.iter_mut() {
+            let Some(representative) = batch_set.representative_entity() else {
                 continue;
             };
-            let Some(scene_unpacking_metadata) =
-                representative_entity_to_batch_set_scene_unpacking_metadata
-                    .get(&representative_entity)
-            else {
+            let Some(ranges) = batch_metadata.get(&representative) else {
                 continue;
             };
-
-            // Write the various buffers to the GPU.
-
-            batch_set
-                .gpu_buffers
-                .render_binned_mesh_instance_buffer
-                .write_buffer(&render_device, &render_queue);
-            batch_set
-                .gpu_buffers
-                .bin_metadata_buffer
-                .write_buffer(&render_device, &render_queue);
-            batch_set
-                .gpu_buffers
-                .fan_buffer
-                .write_buffer(&render_device);
-            batch_set
-                .gpu_buffers
-                .bin_index_to_bin_metadata_index_buffer
-                .write_buffer(&render_device, &render_queue);
-
-            let (
-                Some(render_bin_entry_buffer),
-                Some(bin_metadata_buffer),
-                Some(fan_buffer),
-                Some(bin_index_to_bin_metadata_index_buffer),
-            ) = (
-                batch_set
-                    .gpu_buffers
-                    .render_binned_mesh_instance_buffer
-                    .buffer(),
-                batch_set.gpu_buffers.bin_metadata_buffer.buffer(),
-                batch_set.gpu_buffers.fan_buffer.buffer(),
-                batch_set
-                    .gpu_buffers
-                    .bin_index_to_bin_metadata_index_buffer
-                    .buffer(),
-            )
-            else {
+            let source = &mut batch_set.source;
+            if !seen_sources.contains(&source.id) {
                 continue;
-            };
-
-            let binned_mesh_instance_count = batch_set
-                .gpu_buffers
-                .render_binned_mesh_instance_buffer
-                .len() as u32;
-            let bin_count = batch_set.bin_count() as u32;
-
-            // Build up the `GpuSceneUnpackingMetadata` for this batch set.
-            let gpu_metadata_index =
-                scene_unpacking_buffers
-                    .metadata
-                    .push(GpuSceneUnpackingMetadata {
-                        batch_set_index: scene_unpacking_metadata.batch_set_index,
-                        bin_count,
-                        first_indirect_parameters_index: scene_unpacking_metadata
-                            .first_indirect_parameters_index,
-                        first_output_mesh_uniform_index: scene_unpacking_metadata
-                            .first_output_mesh_uniform_index,
-                        base_output_work_item_index: scene_unpacking_metadata
-                            .base_output_work_item_index,
-                        base_indirect_parameters_index: scene_unpacking_metadata
-                            .base_indirect_parameters_index,
-                        binned_mesh_instance_count,
-                        pad: [0; _],
-                    });
-
-            let Some(gpu_metadata_index) = NonMaxU32::new(gpu_metadata_index as u32) else {
-                continue;
-            };
-
-            // Create the [`SceneUnpackingJob`].
-            let job = SceneUnpackingJob {
-                render_binned_mesh_instance_buffer: render_bin_entry_buffer.clone(),
-                bin_metadata_buffer: bin_metadata_buffer.clone(),
-                fan_buffer: fan_buffer.clone(),
-                bin_index_to_bin_metadata_index_buffer: bin_index_to_bin_metadata_index_buffer
-                    .clone(),
-                metadata_index: SceneUnpackingMetadataIndex(gpu_metadata_index),
-                mesh_instance_count: binned_mesh_instance_count,
+            }
+            let allocation = source_allocations
+                .get_mut(&source.id)
+                .expect("nonempty scene source was allocated");
+            let slab = *sources
+                .key_to_slab
+                .get(&source.id)
+                .expect("allocated scene source has a slab");
+            let words = source_word_count(source).expect("source size checked before allocation");
+            let byte_len = words as usize * size_of::<u32>();
+            if allocation.pending {
+                let initialized = Cell::new(false);
+                sources.copy_element_data(
+                    &source.id,
+                    byte_len,
+                    |output| {
+                        copy_source_data(source, output);
+                        initialized.set(true);
+                    },
+                    &render_device,
+                    &render_queue,
+                );
+                assert!(
+                    initialized.get(),
+                    "scene source {:?} initialization failed",
+                    source.id
+                );
+                allocation.pending = false;
+                source.changed = false;
+            } else if source.changed {
+                let slice = sources
+                    .slab_allocation_slice(&source.id, slab)
+                    .expect("resident scene source has an initialized slice");
+                let mut output = render_queue
+                    .write_buffer_with(
+                        slice.buffer,
+                        u64::from(slice.range.start) * size_of::<u32>() as u64,
+                        BufferSize::new(byte_len as u64).expect("nonempty scene source"),
+                    )
+                    .expect("validated scene source upload fits its physical slab");
+                copy_source_data(source, output.slice(..byte_len));
+                source.changed = false;
+            }
+            let slice = sources
+                .slab_allocation_slice(&source.id, slab)
+                .expect("uploaded scene source has an initialized slice");
+            allocation.capacity_words = slice.range.end - slice.range.start;
+            let bin_count = source.bins.len() as u32;
+            let instance_count = source.instances.len() as u32;
+            let bin_workgroup_count = bin_count.div_ceil(UNIFORM_ALLOCATION_WORKGROUP_SIZE);
+            let instance_workgroup_count = instance_count
+                .div_ceil(UNIFORM_ALLOCATION_WORKGROUP_SIZE)
+                .max(1);
+            let workgroup_count = bin_workgroup_count.max(instance_workgroup_count);
+            assert!(bin_count != 0, "nonempty scene source has bins");
+            assert!(
+                bin_workgroup_count <= 1 || workgroup_count <= limits.max_compute_workgroups_per_dimension,
+                "Scene-unpacking source {:?} requests {workgroup_count} workgroups; the device limit is {}",
+                source.id, limits.max_compute_workgroups_per_dimension,
+            );
+            let source_instance_offset =
+                (size_of_val(source.bins.as_slice()) / size_of::<u32>()) as u32;
+            let source_bin_map_offset = source_instance_offset
+                + (size_of_val(source.instances.as_slice()) / size_of::<u32>()) as u32;
+            let mut descriptor = GpuSceneUnpackingMetadata {
+                batch_set_index: ranges.batch_set_index,
                 bin_count,
+                first_indirect_parameters_index: ranges.first_indirect_parameters_index,
+                first_output_mesh_uniform_index: ranges.first_output_mesh_uniform_index,
+                base_output_work_item_index: ranges.base_output_work_item_index,
+                base_indirect_parameters_index: ranges.base_indirect_parameters_index,
+                binned_mesh_instance_count: instance_count,
+                source_base: slice.range.start,
+                source_instance_offset,
+                source_bin_map_offset,
+                fan_base: 0,
+                chunk_index: 0,
+                pad: [0; 4],
             };
-
-            if batch_set_key.indexed() {
-                view_phase_scene_unpacking_buffers
-                    .indexed_unpacking_jobs
-                    .push(job);
+            let jobs = if batch_set_key.indexed() {
+                &mut jobs.indexed_unpacking_jobs
             } else {
-                view_phase_scene_unpacking_buffers
-                    .non_indexed_unpacking_jobs
-                    .push(job);
+                &mut jobs.non_indexed_unpacking_jobs
+            };
+            if bin_workgroup_count > 1 {
+                let fan_end = fan_buffer
+                    .len()
+                    .checked_add(bin_workgroup_count as usize)
+                    .expect("scene-unpacking scratch exceeds the address space");
+                assert!(
+                    fan_end as u64 <= max_source_words,
+                    "Scene-unpacking scratch requests {fan_end} words; the device limit is {max_source_words} words",
+                );
+                let (base, _) = reserve_scene_metadata_blocks(metadata, &limits, 1);
+                let index = SceneUnpackingMetadataIndex(
+                    NonMaxU32::new(base).expect("validated descriptor index"),
+                );
+                let fan_count = fan_end - fan_buffer.len();
+                descriptor.fan_base = fan_buffer.add_multiple(fan_count) as u32;
+                metadata.set(base, descriptor);
+                jobs.push(SceneUnpackingJob {
+                    source_buffer: slice.buffer.clone(),
+                    metadata_index: index,
+                    workgroup_count,
+                    bin_workgroup_count,
+                });
+            } else {
+                let group_key = (slice.buffer.id(), batch_set_key.indexed());
+                let available = open_groups.get(&group_key).map_or(0, |group| {
+                    SCENE_UNPACKING_WORKGROUPS_PER_DISPATCH as u32 - group.count
+                });
+                let block_count = instance_workgroup_count
+                    .saturating_sub(available)
+                    .div_ceil(SCENE_UNPACKING_WORKGROUPS_PER_DISPATCH as u32);
+                let reservation = if block_count == 0 {
+                    (0, 0)
+                } else {
+                    reserve_scene_metadata_blocks(metadata, &limits, block_count as usize)
+                };
+                let mut next_block = 0;
+                for chunk_index in 0..instance_workgroup_count {
+                    let group = match open_groups.entry(group_key) {
+                        Entry::Occupied(entry)
+                            if entry.get().count
+                                < SCENE_UNPACKING_WORKGROUPS_PER_DISPATCH as u32 =>
+                        {
+                            entry.into_mut()
+                        }
+                        entry => {
+                            let base = reservation.0 + next_block * reservation.1;
+                            next_block += 1;
+                            let index = SceneUnpackingMetadataIndex(
+                                NonMaxU32::new(base).expect("validated descriptor index"),
+                            );
+                            let group = OpenSceneUnpackingGroup {
+                                job_index: jobs.len(),
+                                metadata_base: base,
+                                count: 0,
+                            };
+                            jobs.push(SceneUnpackingJob {
+                                source_buffer: slice.buffer.clone(),
+                                metadata_index: index,
+                                workgroup_count: 0,
+                                bin_workgroup_count: 1,
+                            });
+                            match entry {
+                                Entry::Occupied(mut entry) => {
+                                    *entry.get_mut() = group;
+                                    entry.into_mut()
+                                }
+                                Entry::Vacant(entry) => entry.insert(group),
+                            }
+                        }
+                    };
+                    descriptor.chunk_index = chunk_index;
+                    metadata.set(group.metadata_base + group.count, descriptor);
+                    group.count += 1;
+                    jobs[group.job_index].workgroup_count = group.count;
+                }
             }
         }
     }
-
-    // Delete buffers corresponding to dead views.
-    scene_unpacking_buffers
-        .view_phase_buffers
-        .retain(|scene_unpacking_buffers_key, _| {
-            scene_unpacking_buffers_key.phase != phase_type_id
-                || all_seen_view_entities.contains(&scene_unpacking_buffers_key.view)
-        });
 }
 
-/// Clears out the [`SceneUnpackingBuffers`] in preparation for a new frame.
+fn reserve_scene_metadata_blocks(
+    metadata: &mut RawBufferVec<GpuSceneUnpackingMetadata>,
+    limits: &Limits,
+    block_count: usize,
+) -> (u32, u32) {
+    let record_size = size_of::<GpuSceneUnpackingMetadata>();
+    let block_size = record_size * SCENE_UNPACKING_WORKGROUPS_PER_DISPATCH;
+    assert!(
+        block_size as u64 <= limits.max_uniform_buffer_binding_size,
+        "Scene-unpacking descriptors require {block_size} uniform bytes; the device limit is {}",
+        limits.max_uniform_buffer_binding_size,
+    );
+    assert!(
+        SCENE_UNPACKING_WORKGROUPS_PER_DISPATCH as u32 <= limits.max_compute_workgroups_per_dimension,
+        "Scene-unpacking descriptor blocks require {SCENE_UNPACKING_WORKGROUPS_PER_DISPATCH} workgroups; the device limit is {}",
+        limits.max_compute_workgroups_per_dimension,
+    );
+    let alignment = (limits.min_uniform_buffer_offset_alignment as usize).max(record_size);
+    let aligned = metadata
+        .len()
+        .checked_mul(record_size)
+        .and_then(|bytes| bytes.checked_next_multiple_of(alignment))
+        .expect("scene-unpacking descriptor offset exceeds the address space");
+    let stride = block_size
+        .checked_next_multiple_of(alignment)
+        .expect("scene-unpacking descriptor stride exceeds the address space");
+    assert!(
+        aligned.is_multiple_of(record_size) && stride.is_multiple_of(record_size),
+        "Scene-unpacking alignment {alignment} is incompatible with {record_size}-byte records",
+    );
+    let last = block_count
+        .checked_sub(1)
+        .and_then(|last| last.checked_mul(stride))
+        .and_then(|offset| aligned.checked_add(offset))
+        .expect("scene-unpacking descriptor count exceeds the address space");
+    let end = last
+        .checked_add(block_size)
+        .expect("scene-unpacking descriptor size exceeds the address space");
+    assert!(
+        last <= u32::MAX as usize && end as u64 <= limits.max_buffer_size,
+        "Scene-unpacking descriptors require {end} bytes and dynamic offset {last}; device limits are {} buffer bytes and {} offset bytes",
+        limits.max_buffer_size, u32::MAX,
+    );
+    let start = u32::try_from(aligned / record_size).expect("validated descriptor index");
+    let stride = u32::try_from(stride / record_size).expect("validated descriptor stride");
+    metadata.extend(iter::repeat_n(
+        GpuSceneUnpackingMetadata::zeroed(),
+        end / record_size - metadata.len(),
+    ));
+    (start, stride)
+}
+
+/// Clears current-frame dispatches before any phase publishes its new jobs.
 pub fn clear_scene_unpacking_buffers(mut scene_unpacking_buffers: ResMut<SceneUnpackingBuffers>) {
-    scene_unpacking_buffers.metadata.clear();
+    let buffers = &mut *scene_unpacking_buffers;
+    buffers.metadata.clear();
+    buffers.fan_buffer.clear();
+    buffers.fan_buffer.add();
+    buffers.seen_sources.clear();
+    buffers.seen_view_phases.clear();
+    for jobs in buffers.view_phase_buffers.values_mut() {
+        jobs.indexed_unpacking_jobs.clear();
+        jobs.non_indexed_unpacking_jobs.clear();
+    }
 }
 
 /// CPU-side metadata needed to drive the scene unpacking shader for a single batch set.
@@ -3120,5 +3381,372 @@ mod tests {
 
         instance_buffer.add(TestData(5));
         assert_eq!(instance_buffer.buffer().len(), 1);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod scene_sources {
+        use super::*;
+        use bevy_ecs::system::RunSystemOnce;
+        use bevy_material::labels::DrawFunctionId;
+        use bevy_math::Mat4;
+        use bevy_platform::future::block_on;
+        use std::{
+            panic::{catch_unwind, AssertUnwindSafe},
+            sync::mpsc,
+            time::Duration,
+        };
+
+        use crate::{
+            render_phase::{BinnedRenderPhaseType, InputUniformIndex, PhaseItemBatchSetKey},
+            renderer::RenderInstance,
+        };
+        use wgpu::{BufferDescriptor, DeviceDescriptor, MapMode, PollType, TextureFormat};
+
+        struct SourcePhase;
+
+        #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        struct SourceBatchKey(u32);
+
+        impl PhaseItemBatchSetKey for SourceBatchKey {
+            fn indexed(&self) -> bool {
+                true
+            }
+        }
+
+        impl PhaseItem for SourcePhase {
+            fn entity(&self) -> Entity {
+                unreachable!()
+            }
+            fn main_entity(&self) -> MainEntity {
+                unreachable!()
+            }
+            fn draw_function(&self) -> DrawFunctionId {
+                unreachable!()
+            }
+            fn batch_range(&self) -> &Range<u32> {
+                unreachable!()
+            }
+            fn batch_range_mut(&mut self) -> &mut Range<u32> {
+                unreachable!()
+            }
+            fn extra_index(&self) -> PhaseItemExtraIndex {
+                unreachable!()
+            }
+            fn batch_range_and_extra_index_mut(
+                &mut self,
+            ) -> (&mut Range<u32>, &mut PhaseItemExtraIndex) {
+                unreachable!()
+            }
+        }
+
+        impl BinnedPhaseItem for SourcePhase {
+            type BinKey = u32;
+            type BatchSetKey = SourceBatchKey;
+
+            fn new(
+                _: Self::BatchSetKey,
+                _: Self::BinKey,
+                _: (Entity, MainEntity),
+                _: Range<u32>,
+                _: PhaseItemExtraIndex,
+            ) -> Self {
+                Self
+            }
+        }
+
+        #[test]
+        #[ignore = "requires a graphics adapter"]
+        fn shared_sources_preserve_uploads_growth_and_retirement() {
+            let instance = RenderInstance::new(Default::default());
+            let adapter = block_on(instance.request_adapter(&Default::default()))
+                .expect("graphics adapter for scene sources");
+            let (device, queue) = block_on(adapter.request_device(&DeviceDescriptor::default()))
+                .expect("device for scene sources");
+            let mut world = World::new();
+            world.insert_resource(RenderDevice::new(device));
+            world.insert_resource(RenderQueue::new(queue));
+
+            for dedicated in [false, true] {
+                world.init_resource::<SceneUnpackingBuffers>();
+                {
+                    let mut buffers = world.resource_mut::<SceneUnpackingBuffers>();
+                    buffers.source_settings.min_slab_size = 64;
+                    buffers.source_settings.max_slab_size = 8192;
+                    buffers.source_settings.large_threshold = if dedicated { 32 } else { 8192 };
+                }
+                let view_entity = world.spawn_empty().id();
+                let view = RetainedViewEntity::new(view_entity.into(), None, 0);
+                world.entity_mut(view_entity).insert(ExtractedView {
+                    retained_view_entity: view,
+                    clip_from_view: Mat4::IDENTITY,
+                    world_from_view: Default::default(),
+                    clip_from_world: None,
+                    target_format: TextureFormat::Rgba8Unorm,
+                    viewport: UVec4::new(0, 0, 1, 1),
+                    color_grading: Default::default(),
+                    invert_culling: false,
+                });
+                let mut phases = ViewBinnedRenderPhases::<SourcePhase>::default();
+                phases.prepare_for_new_frame(view, GpuPreprocessingMode::Culling);
+                world.insert_resource(phases);
+                let first_entities = add_source(&mut world, view, 0, &[11, 29]);
+                add_source(&mut world, view, 1, &[47]);
+                run_sources(&mut world);
+                let initial = published_sources(&world, view);
+                assert_eq!(initial.len(), 2);
+                assert_eq!(
+                    read_words(&world, &initial[0].0, initial[0].1.source_base, 8),
+                    [0, 0, 2, 11, 0, 29, 0, 0],
+                );
+                assert_eq!(
+                    read_words(&world, &initial[1].0, initial[1].1.source_base, 6),
+                    [0, 0, 1, 47, 0, 0],
+                );
+                if !dedicated {
+                    assert_eq!(initial[0].0.id(), initial[1].0.id());
+                    let buffers = world.resource::<SceneUnpackingBuffers>();
+                    assert_eq!(
+                        buffers.view_phase_buffers[&SceneUnpackingBuffersKey {
+                            phase: TypeId::of::<SourcePhase>(),
+                            view,
+                        }]
+                            .indexed_unpacking_jobs
+                            .len(),
+                        1
+                    );
+                }
+
+                let poisoned = initial[0].1.source_base + initial[0].1.source_instance_offset;
+                world.resource::<RenderQueue>().write_buffer(
+                    &initial[0].0,
+                    u64::from(poisoned) * 4,
+                    cast_slice(&[101u32]),
+                );
+                run_sources(&mut world);
+                let unchanged = published_sources(&world, view);
+                assert_eq!(
+                    read_words(&world, &unchanged[0].0, unchanged[0].1.source_base, 8),
+                    [0, 0, 2, 101, 0, 29, 0, 0],
+                    "unchanged CPU tables must not be uploaded",
+                );
+
+                add_source(&mut world, view, 1, &[53]);
+                run_sources(&mut world);
+                let changed = published_sources(&world, view);
+                assert_eq!(
+                    read_words(&world, &changed[1].0, changed[1].1.source_base, 8),
+                    [0, 0, 2, 47, 0, 53, 0, 0],
+                );
+                if dedicated {
+                    assert_ne!(
+                        initial[1].0.id(),
+                        changed[1].0.id(),
+                        "dedicated slabs must grow past their physical six-word allocation",
+                    );
+                }
+
+                let more: Vec<u32> = (100..200).collect();
+                add_source(&mut world, view, 1, &more);
+                run_sources(&mut world);
+                let grown = published_sources(&world, view);
+                assert_eq!(
+                    read_words(&world, &grown[0].0, grown[0].1.source_base, 8),
+                    [0, 0, 2, 101, 0, 29, 0, 0],
+                    "slab growth preserves unchanged resident bytes",
+                );
+                assert_eq!(
+                    read_words(&world, &grown[1].0, grown[1].1.source_base, 9),
+                    [0, 0, 102, 47, 0, 53, 0, 100, 0],
+                );
+                if !dedicated {
+                    assert_ne!(initial[0].0.id(), grown[0].0.id());
+                }
+                {
+                    let mut phases = world.resource_mut::<ViewBinnedRenderPhases<SourcePhase>>();
+                    for entity in first_entities {
+                        phases
+                            .get_mut(&view)
+                            .expect("source view")
+                            .remove(entity.into());
+                    }
+                }
+                publish_ranges(&mut world, view);
+                run_sources(&mut world);
+                assert_eq!(
+                    world
+                        .resource::<SceneUnpackingBuffers>()
+                        .source_allocations
+                        .len(),
+                    1
+                );
+                let retained = published_sources(&world, view);
+                let pending_readback =
+                    copy_words(&world, &retained[0].0, retained[0].1.source_base, 9);
+                drop(initial);
+                drop(unchanged);
+                drop(changed);
+                drop(grown);
+                drop(retained);
+                if !dedicated {
+                    world
+                        .resource_mut::<SceneUnpackingBuffers>()
+                        .source_settings
+                        .max_slab_size = 4;
+                    let rejected = catch_unwind(AssertUnwindSafe(|| run_sources(&mut world)));
+                    assert!(
+                        rejected.is_err(),
+                        "capacity failure must abort before mesh consumers run"
+                    );
+                    world
+                        .resource_mut::<SceneUnpackingBuffers>()
+                        .source_settings
+                        .max_slab_size = 8192;
+                }
+                world.despawn(view_entity);
+                run_sources(&mut world);
+                let buffers = world.resource::<SceneUnpackingBuffers>();
+                assert!(buffers.source_allocations.is_empty());
+                assert!(buffers.view_phase_buffers.is_empty());
+                assert_eq!(buffers.sources.slab_count(), 0);
+                assert_eq!(
+                    map_words(&world, &pending_readback),
+                    [0, 0, 102, 47, 0, 53, 0, 100, 0],
+                    "submitted consumers retain retired backing",
+                );
+                world.remove_resource::<SceneUnpackingBuffers>();
+            }
+        }
+
+        fn add_source(
+            world: &mut World,
+            view: RetainedViewEntity,
+            batch: u32,
+            inputs: &[u32],
+        ) -> Vec<Entity> {
+            let entities: Vec<_> = inputs.iter().map(|_| world.spawn_empty().id()).collect();
+            {
+                let mut phases = world.resource_mut::<ViewBinnedRenderPhases<SourcePhase>>();
+                let phase = phases.get_mut(&view).expect("source view");
+                for (&entity, &input) in entities.iter().zip(inputs) {
+                    phase.add(
+                        SourceBatchKey(batch),
+                        0,
+                        (entity, entity.into()),
+                        InputUniformIndex(input),
+                        BinnedRenderPhaseType::MultidrawableMesh,
+                    );
+                }
+            }
+            publish_ranges(world, view);
+            entities
+        }
+
+        fn publish_ranges(world: &mut World, view: RetainedViewEntity) {
+            let mut phases = world.resource_mut::<ViewBinnedRenderPhases<SourcePhase>>();
+            let phase = phases.get_mut(&view).expect("source view");
+            let BinnedRenderPhaseBatchSets::MultidrawIndirect(ranges) = &mut phase.batch_sets
+            else {
+                panic!("indirect source phase");
+            };
+            ranges.clear();
+            let mut first_work_item_index = 0;
+            for (index, batch) in phase.multidrawable_meshes.values().enumerate() {
+                let representative = batch.representative_entity().expect("nonempty source");
+                ranges.push(BinnedRenderPhaseBatchSet {
+                    first_batch: BinnedRenderPhaseBatch {
+                        representative_entity: (*representative, representative),
+                        instance_range: 0..batch.source.instances.len() as u32,
+                        extra_index: PhaseItemExtraIndex::IndirectParametersIndex {
+                            range: index as u32..index as u32 + 1,
+                            batch_set_index: None,
+                        },
+                    },
+                    bin_key: 0,
+                    batch_count: 1,
+                    index: index as u32,
+                    first_work_item_index,
+                    first_indirect_parameters_index: index as u32,
+                    first_output_mesh_uniform_index: first_work_item_index,
+                });
+                first_work_item_index += batch.source.instances.len() as u32;
+            }
+        }
+
+        fn run_sources(world: &mut World) {
+            world
+                .run_system_once(clear_scene_unpacking_buffers)
+                .expect("clear source dispatches");
+            world
+                .run_system_once(write_binned_instance_buffers::<SourcePhase>)
+                .expect("publish scene sources");
+            world
+                .resource_mut::<SceneUnpackingBuffers>()
+                .retire_unused();
+        }
+
+        fn published_sources(
+            world: &World,
+            view: RetainedViewEntity,
+        ) -> Vec<(Buffer, GpuSceneUnpackingMetadata)> {
+            let buffers = world.resource::<SceneUnpackingBuffers>();
+            let jobs = &buffers.view_phase_buffers[&SceneUnpackingBuffersKey {
+                phase: TypeId::of::<SourcePhase>(),
+                view,
+            }]
+                .indexed_unpacking_jobs;
+            jobs.iter()
+                .flat_map(|job| {
+                    (0..job.workgroup_count).map(|index| {
+                        (
+                            job.source_buffer.clone(),
+                            *buffers
+                                .metadata
+                                .get(job.metadata_index.get() + index)
+                                .expect("initialized scene descriptor"),
+                        )
+                    })
+                })
+                .collect()
+        }
+
+        fn read_words(world: &World, buffer: &Buffer, start: u32, count: u64) -> Vec<u32> {
+            map_words(world, &copy_words(world, buffer, start, count))
+        }
+
+        fn copy_words(world: &World, buffer: &Buffer, start: u32, count: u64) -> Buffer {
+            let device = world.resource::<RenderDevice>();
+            let queue = world.resource::<RenderQueue>();
+            let readback = device.create_buffer(&BufferDescriptor {
+                label: Some("shared source readback"),
+                size: count * 4,
+                usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device.create_command_encoder(&Default::default());
+            encoder.copy_buffer_to_buffer(buffer, u64::from(start) * 4, &readback, 0, count * 4);
+            queue.submit([encoder.finish()]);
+            readback
+        }
+
+        fn map_words(world: &World, readback: &Buffer) -> Vec<u32> {
+            let device = world.resource::<RenderDevice>();
+            let (sender, receiver) = mpsc::channel();
+            let slice = readback.slice(..);
+            slice.map_async(MapMode::Read, move |result| {
+                sender.send(result).expect("source readback receiver");
+            });
+            device
+                .poll(PollType::wait_indefinitely())
+                .expect("source GPU completion");
+            receiver
+                .recv_timeout(Duration::from_secs(10))
+                .expect("source readback callback")
+                .expect("mapped source bytes");
+            let mapped = slice.get_mapped_range().expect("source readback bytes");
+            let words = cast_slice(&mapped).to_vec();
+            drop(mapped);
+            readback.unmap();
+            words
+        }
     }
 }

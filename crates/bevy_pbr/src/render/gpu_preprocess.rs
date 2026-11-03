@@ -37,17 +37,18 @@ use bevy_platform::collections::HashMap;
 use bevy_render::{
     batching::gpu_preprocessing::{
         clear_scene_unpacking_buffers, BatchedInstanceBuffers, BuildIndirectParametersMetadata,
-        GpuBinMetadata, GpuOcclusionCullingWorkItemBuffers, GpuPreprocessingMode,
-        GpuPreprocessingSupport, GpuSceneUnpackingMetadata, IndirectBatchSet,
-        IndirectParametersBuffers, IndirectParametersBuildJob, IndirectParametersBuildJobs,
-        IndirectParametersIndexed, IndirectParametersMetadata, IndirectParametersNonIndexed,
+        GpuOcclusionCullingWorkItemBuffers, GpuPreprocessingMode, GpuPreprocessingSupport,
+        GpuSceneUnpackingMetadata, IndirectBatchSet, IndirectParametersBuffers,
+        IndirectParametersBuildJob, IndirectParametersBuildJobs, IndirectParametersIndexed,
+        IndirectParametersMetadata, IndirectParametersNonIndexed,
         LatePreprocessWorkItemIndirectParameters, PreprocessWorkItem, PreprocessWorkItemBuffers,
         SceneUnpackingBuffers, SceneUnpackingBuffersKey, SceneUnpackingMetadataIndex,
         UntypedPhaseBatchedInstanceBuffers, UntypedPhaseIndirectParametersBuffers,
+        SCENE_UNPACKING_WORKGROUPS_PER_DISPATCH,
     },
     diagnostic::RecordDiagnostics as _,
     occlusion_culling::OcclusionCulling,
-    render_phase::{GpuRenderBinnedMeshInstance, UNIFORM_ALLOCATION_WORKGROUP_SIZE},
+    render_phase::UNIFORM_ALLOCATION_WORKGROUP_SIZE,
     render_resource::{
         binding_types::{storage_buffer, storage_buffer_read_only, texture_2d, uniform_buffer},
         BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
@@ -66,7 +67,7 @@ use bevy_render::{
     },
     GpuResourceAppExt, Render, RenderApp, RenderSystems,
 };
-use bevy_shader::Shader;
+use bevy_shader::{Shader, ShaderDefVal};
 use bevy_utils::{default, TypeIdHashMap};
 use bitflags::bitflags;
 use smallvec::{smallvec, SmallVec};
@@ -224,6 +225,17 @@ pub struct SceneUnpackingPipeline {
     pub shader: Handle<Shader>,
     /// The pipeline ID for the first step of the `unpack_scene` shader.
     pub pipeline_id: Option<CachedComputePipelineId>,
+    /// The local scan for a single job spanning more than one bin workgroup.
+    pub large_pipeline_id: Option<CachedComputePipelineId>,
+}
+
+/// Dispatch layout for shared-source scene preparation.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SceneUnpackingPipelineKey {
+    /// Each workgroup reads its own bounded job-chunk descriptor.
+    Grouped,
+    /// All workgroups share one large job, followed by global scan and fan.
+    Large,
 }
 
 /// The global prefix scan for allocations spanning multiple workgroups.
@@ -413,18 +425,19 @@ pub struct ViewPhaseSceneUnpackingBindGroups {
     non_indexed: Vec<ViewPhaseSceneUnpackingBindGroup>,
 }
 
-/// Scene-unpacking bindings and dispatch sizes for one cached batch set.
+/// Shared-source bindings and current-frame dispatch extents.
 #[derive(Clone)]
 pub struct ViewPhaseSceneUnpackingBindGroup {
-    /// The index of the metadata in the
-    /// [`SceneUnpackingBuffers::metadata`] buffer.
+    /// First record of a reserved current-frame uniform block in
+    /// [`SceneUnpackingBuffers::metadata`].
     pub metadata_index: SceneUnpackingMetadataIndex,
     /// The actual shader bind group.
     pub bind_group: BindGroup,
-    /// The total number of bins in this batch set.
-    pub bin_count: u32,
-    /// The number of cached instances; it can exceed the bin count.
-    pub mesh_instance_count: u32,
+    /// Initialized descriptor chunks, or the full extent of one large job.
+    /// Grouped counts must fit their initialized uniform block.
+    pub workgroup_count: u32,
+    /// More than one bin workgroup requires global scan and fan passes.
+    pub bin_workgroup_count: u32,
 }
 
 /// Stops the `GpuPreprocessNode` attempting to generate the buffer for this view
@@ -544,10 +557,15 @@ pub fn unpack_scene(
 
     let (
         Some(scene_unpacking_pipeline_id),
+        Some(large_scene_unpacking_pipeline_id),
         Some(uniform_allocation_global_scan_pipeline_id),
         Some(uniform_allocation_fan_pipeline_id),
     ) = (
         preprocess_pipelines.scene_unpacking.local_scan.pipeline_id,
+        preprocess_pipelines
+            .scene_unpacking
+            .local_scan
+            .large_pipeline_id,
         preprocess_pipelines
             .scene_unpacking
             .global_scan
@@ -560,10 +578,12 @@ pub fn unpack_scene(
 
     let (
         Some(scene_unpacking_pipeline),
+        Some(large_scene_unpacking_pipeline),
         Some(uniform_allocation_global_scan_pipeline),
         Some(uniform_allocation_fan_pipeline),
     ) = (
         pipeline_cache.get_compute_pipeline(scene_unpacking_pipeline_id),
+        pipeline_cache.get_compute_pipeline(large_scene_unpacking_pipeline_id),
         pipeline_cache.get_compute_pipeline(uniform_allocation_global_scan_pipeline_id),
         pipeline_cache.get_compute_pipeline(uniform_allocation_fan_pipeline_id),
     )
@@ -616,6 +636,7 @@ pub fn unpack_scene(
                 dispatch_scene_unpacking(
                     &mut compute_pass,
                     scene_unpacking_pipeline,
+                    large_scene_unpacking_pipeline,
                     uniform_allocation_global_scan_pipeline,
                     uniform_allocation_fan_pipeline,
                     scene_unpacking_bind_group,
@@ -630,23 +651,22 @@ pub fn unpack_scene(
 fn dispatch_scene_unpacking(
     pass: &mut ComputePass<'_>,
     local_scan: &ComputePipeline,
+    large_local_scan: &ComputePipeline,
     global_scan: &ComputePipeline,
     fan: &ComputePipeline,
     bindings: &ViewPhaseSceneUnpackingBindGroup,
 ) {
-    let bin_workgroups = bindings
-        .bin_count
-        .div_ceil(UNIFORM_ALLOCATION_WORKGROUP_SIZE);
-    let workgroups = bin_workgroups.max(
-        bindings
-            .mesh_instance_count
-            .div_ceil(UNIFORM_ALLOCATION_WORKGROUP_SIZE),
-    );
+    let bin_workgroups = bindings.bin_workgroup_count;
+    let workgroups = bindings.workgroup_count;
     if workgroups == 0 {
         return;
     }
 
-    pass.set_pipeline(local_scan);
+    pass.set_pipeline(if bin_workgroups > 1 {
+        large_local_scan
+    } else {
+        local_scan
+    });
     pass.set_bind_group(
         0,
         &bindings.bind_group,
@@ -1289,11 +1309,12 @@ impl PreprocessPipelines {
 }
 
 impl SceneUnpackingPipelines {
-    /// Returns true if all three uniform allocation pipelines have been
+    /// Returns true if all scene-unpacking pipelines have been
     /// loaded into the pipeline cache or false otherwise.
     fn is_loaded(&self, pipeline_cache: &PipelineCache) -> bool {
         [
             self.local_scan.pipeline_id,
+            self.local_scan.large_pipeline_id,
             self.global_scan.pipeline_id_global_scan,
             self.fan.pipeline_id_fan,
         ]
@@ -1535,6 +1556,7 @@ impl FromWorld for PreprocessPipelines {
                     bind_group_layout: scene_unpacking_bind_group_layout.clone(),
                     shader: scene_unpacking_shader.clone(),
                     pipeline_id: None,
+                    large_pipeline_id: None,
                 },
                 global_scan: UniformAllocationGlobalScanPipeline {
                     bind_group_layout: scene_unpacking_bind_group_layout.clone(),
@@ -1640,24 +1662,24 @@ fn gpu_occlusion_culling_bind_group_layout_entries() -> DynamicBindGroupLayoutEn
 
 /// Creates bind group layout entries for GPU scene unpacking
 /// shader (`unpack_scene`).
-fn scene_unpacking_bind_group_layout_entries() -> BindGroupLayoutEntries<7> {
+fn scene_unpacking_bind_group_layout_entries() -> BindGroupLayoutEntries<5> {
     BindGroupLayoutEntries::sequential(
         ShaderStages::COMPUTE,
         (
             // @group(0) @binding(0) var<uniform> metadata:
             // SceneUnpackingMetadata;
-            uniform_buffer::<GpuSceneUnpackingMetadata>(true),
-            // @group(0) @binding(1) var<storage> bin_metadata: array<BinMetadata>;
-            storage_buffer_read_only::<GpuBinMetadata>(false),
+            uniform_buffer::<[GpuSceneUnpackingMetadata; SCENE_UNPACKING_WORKGROUPS_PER_DISPATCH]>(
+                true,
+            ),
+            // @group(0) @binding(1) var<storage> source_words: array<u32>;
+            storage_buffer_read_only::<u32>(false),
             // @group(0) @binding(2) var<storage, read_write>
             // indirect_parameters_metadata: array<IndirectParametersMetadata>;
             storage_buffer::<IndirectParametersMetadata>(false),
             // @group(0) @binding(3) var<storage, read_write> fan_buffer:
             // array<u32>;
             storage_buffer::<u32>(false),
-            storage_buffer_read_only::<GpuRenderBinnedMeshInstance>(false),
             storage_buffer::<PreprocessWorkItem>(false),
-            storage_buffer_read_only::<u32>(false),
         ),
     )
 }
@@ -1887,15 +1909,21 @@ impl SpecializedComputePipeline for BuildIndirectParametersPipeline {
 }
 
 impl SpecializedComputePipeline for SceneUnpackingPipeline {
-    type Key = ();
+    type Key = SceneUnpackingPipelineKey;
 
-    fn specialize(&self, _: Self::Key) -> ComputePipelineDescriptor {
+    fn specialize(&self, key: Self::Key) -> ComputePipelineDescriptor {
         ComputePipelineDescriptor {
             label: Some("scene unpacking".into()),
             layout: vec![self.bind_group_layout.clone()],
             shader: self.shader.clone(),
-            shader_defs: vec![],
-            entry_point: Some("unpack_scene".into()),
+            shader_defs: scene_unpacking_shader_defs(),
+            entry_point: Some(
+                match key {
+                    SceneUnpackingPipelineKey::Grouped => "unpack_scene",
+                    SceneUnpackingPipelineKey::Large => "unpack_large_scene",
+                }
+                .into(),
+            ),
             ..Default::default()
         }
     }
@@ -1909,7 +1937,7 @@ impl SpecializedComputePipeline for UniformAllocationGlobalScanPipeline {
             label: Some("uniform allocation, global scan".into()),
             layout: vec![self.bind_group_layout.clone()],
             shader: self.shader.clone(),
-            shader_defs: vec![],
+            shader_defs: scene_unpacking_shader_defs(),
             entry_point: Some("allocate_global_scan".into()),
             ..Default::default()
         }
@@ -1924,11 +1952,24 @@ impl SpecializedComputePipeline for UniformAllocationFanPipeline {
             label: Some("uniform allocation, fan".into()),
             layout: vec![self.bind_group_layout.clone()],
             shader: self.shader.clone(),
-            shader_defs: vec![],
+            shader_defs: scene_unpacking_shader_defs(),
             entry_point: Some("allocate_fan".into()),
             ..Default::default()
         }
     }
+}
+
+fn scene_unpacking_shader_defs() -> Vec<ShaderDefVal> {
+    vec![
+        ShaderDefVal::UInt(
+            "SCENE_UNPACKING_WORKGROUP_SIZE".into(),
+            UNIFORM_ALLOCATION_WORKGROUP_SIZE,
+        ),
+        ShaderDefVal::UInt(
+            "SCENE_UNPACKING_WORKGROUPS_PER_DISPATCH".into(),
+            SCENE_UNPACKING_WORKGROUPS_PER_DISPATCH as u32,
+        ),
+    ]
 }
 
 impl ResetIndirectBatchSetsPipeline {
@@ -1963,7 +2004,7 @@ impl BuildIndirectParametersPipeline {
 }
 
 impl SceneUnpackingPipelines {
-    /// Specializes all three pipelines that use the uniform allocation shader.
+    /// Specializes grouped work and the three stages of large allocation scans.
     fn prepare(
         &mut self,
         pipeline_cache: &PipelineCache,
@@ -1976,8 +2017,19 @@ impl SceneUnpackingPipelines {
         >,
     ) {
         if self.local_scan.pipeline_id.is_none() {
-            self.local_scan.pipeline_id =
-                Some(scene_unpacking_pipelines.specialize(pipeline_cache, &self.local_scan, ()));
+            self.local_scan.pipeline_id = Some(scene_unpacking_pipelines.specialize(
+                pipeline_cache,
+                &self.local_scan,
+                SceneUnpackingPipelineKey::Grouped,
+            ));
+        }
+
+        if self.local_scan.large_pipeline_id.is_none() {
+            self.local_scan.large_pipeline_id = Some(scene_unpacking_pipelines.specialize(
+                pipeline_cache,
+                &self.local_scan,
+                SceneUnpackingPipelineKey::Large,
+            ));
         }
 
         if self.global_scan.pipeline_id_global_scan.is_none() {
@@ -3128,6 +3180,9 @@ fn create_scene_unpacking_bind_groups(
     let Some(metadata_buffer) = scene_unpacking_buffers.metadata.buffer() else {
         return;
     };
+    let Some(fan_buffer) = scene_unpacking_buffers.fan_buffer.buffer() else {
+        return;
+    };
 
     for (phase, indirect_buffers) in indirect_parameters_buffers.iter() {
         let key = SceneUnpackingBuffersKey {
@@ -3183,22 +3238,22 @@ fn create_scene_unpacking_bind_groups(
                         BindingResource::Buffer(BufferBinding {
                             buffer: metadata_buffer,
                             offset: 0,
-                            size: NonZeroU64::new(size_of::<GpuSceneUnpackingMetadata>() as u64),
+                            size: NonZeroU64::new(size_of::<
+                                [GpuSceneUnpackingMetadata;
+                                    SCENE_UNPACKING_WORKGROUPS_PER_DISPATCH],
+                            >() as u64),
                         }),
-                        job.bin_metadata_buffer.as_entire_binding(),
+                        job.source_buffer.as_entire_binding(),
                         indirect_metadata.as_entire_binding(),
-                        job.fan_buffer.as_entire_binding(),
-                        job.render_binned_mesh_instance_buffer.as_entire_binding(),
+                        fan_buffer.as_entire_binding(),
                         work_items.as_entire_binding(),
-                        job.bin_index_to_bin_metadata_index_buffer
-                            .as_entire_binding(),
                     )),
                 );
                 output.push(ViewPhaseSceneUnpackingBindGroup {
                     metadata_index: job.metadata_index,
                     bind_group,
-                    bin_count: job.bin_count,
-                    mesh_instance_count: job.mesh_instance_count,
+                    workgroup_count: job.workgroup_count,
+                    bin_workgroup_count: job.bin_workgroup_count,
                 });
             }
         }
@@ -3241,7 +3296,7 @@ mod tests {
     };
     use bevy_shader::ShaderLoader;
     use bevy_tasks::{AsyncComputeTaskPool, ComputeTaskPool, IoTaskPool, TaskPool};
-    use bytemuck::{bytes_of, cast_slice};
+    use bytemuck::{cast_slice, Zeroable};
     use nonmax::NonMaxU32;
     use std::{
         sync::mpsc,
@@ -3255,7 +3310,7 @@ mod tests {
         queue: RenderQueue,
         cache: PipelineCache,
         layout: BindGroupLayoutDescriptor,
-        pipelines: [CachedComputePipelineId; 3],
+        pipelines: [CachedComputePipelineId; 4],
     }
 
     impl UnpackingGpu {
@@ -3322,7 +3377,18 @@ mod tests {
                 .bind_group_layout
                 .clone();
             let ids = [
-                cache.queue_compute_pipeline(pipelines.scene_unpacking.local_scan.specialize(())),
+                cache.queue_compute_pipeline(
+                    pipelines
+                        .scene_unpacking
+                        .local_scan
+                        .specialize(SceneUnpackingPipelineKey::Grouped),
+                ),
+                cache.queue_compute_pipeline(
+                    pipelines
+                        .scene_unpacking
+                        .local_scan
+                        .specialize(SceneUnpackingPipelineKey::Large),
+                ),
                 cache.queue_compute_pipeline(pipelines.scene_unpacking.global_scan.specialize(())),
                 cache.queue_compute_pipeline(pipelines.scene_unpacking.fan.specialize(())),
             ];
@@ -3359,26 +3425,55 @@ mod tests {
             expected_work_items: &[(usize, [u32; 2])],
         ) {
             let bin_count = counts.len() as u32;
+            let job_count = if bin_count <= 256 { 2 } else { 1 };
+            let bin_workgroups = bin_count.div_ceil(256);
+            let instance_workgroups = (instances.len() as u32).div_ceil(256);
+            let chunks_per_job = bin_workgroups.max(instance_workgroups);
+            let descriptor_count = if bin_workgroups > 1 {
+                1
+            } else {
+                chunks_per_job * job_count
+            };
+            let block_count =
+                (descriptor_count as usize).div_ceil(SCENE_UNPACKING_WORKGROUPS_PER_DISPATCH);
             let bins: Vec<_> = counts
                 .iter()
                 .enumerate()
                 .flat_map(|(index, count)| [2 * index as u32, 2 * index as u32 + 1, *count])
                 .collect();
-            let bin_metadata = self.buffer(&bins, BufferUsages::STORAGE);
             let mut mapping = vec![0xdead_beef; counts.len() * 2];
             for index in 0..counts.len() {
                 mapping[index * 2 + 1] = index as u32;
             }
-            let mapping = self.buffer(&mapping, BufferUsages::STORAGE);
-            let instances_buffer = self.buffer(cast_slice(instances), BufferUsages::STORAGE);
-            let fan = self.buffer(&vec![0; counts.len().div_ceil(256)], BufferUsages::STORAGE);
-            let indirect_initial = vec![0xdead_beef; (counts.len() * 2 + 4) * 5];
-            let work_initial = vec![0xdead_beef; (instances.len() + 6) * 2];
+            let mut source_words = vec![0xdead_beef; 4];
+            let mut source_bases = Vec::new();
+            for job in 0..job_count {
+                source_bases.push(source_words.len() as u32);
+                source_words.extend_from_slice(&bins);
+                source_words.extend(
+                    instances
+                        .iter()
+                        .flat_map(|instance| [instance[0] + job * 10_000, instance[1]]),
+                );
+                source_words.extend_from_slice(&mapping);
+            }
+            let source = self.buffer(&source_words, BufferUsages::STORAGE);
+            let fan_initial = vec![0xdead_beef; counts.len().div_ceil(256) + 6];
+            let fan = self.buffer(&fan_initial, BufferUsages::STORAGE | BufferUsages::COPY_SRC);
+            let indirect_initial =
+                vec![0xdead_beef; (counts.len() * 2 * job_count as usize + 4) * 5];
+            let work_initial = vec![0xdead_beef; (instances.len() * job_count as usize + 6) * 2];
             let output_usage =
                 BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC;
             let indirect = self.buffer(&indirect_initial, output_usage);
             let work = self.buffer(&work_initial, output_usage);
-            let metadata = self.buffer(&[0; 128], BufferUsages::UNIFORM | BufferUsages::COPY_DST);
+            let block_size = size_of::<
+                [GpuSceneUnpackingMetadata; SCENE_UNPACKING_WORKGROUPS_PER_DISPATCH],
+            >() as u64;
+            let metadata = self.buffer(
+                &vec![0; block_size as usize * (block_count + 1) / 4],
+                BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            );
             let binding = self.device.create_bind_group(
                 "scene-unpacking regression",
                 &self.cache.get_bind_group_layout(&self.layout),
@@ -3386,48 +3481,79 @@ mod tests {
                     BindingResource::Buffer(BufferBinding {
                         buffer: &metadata,
                         offset: 0,
-                        size: NonZeroU64::new(256),
+                        size: NonZeroU64::new(block_size),
                     }),
-                    bin_metadata.as_entire_binding(),
+                    source.as_entire_binding(),
                     indirect.as_entire_binding(),
                     fan.as_entire_binding(),
-                    instances_buffer.as_entire_binding(),
                     work.as_entire_binding(),
-                    mapping.as_entire_binding(),
                 )),
             );
-            let bindings = ViewPhaseSceneUnpackingBindGroup {
-                metadata_index: SceneUnpackingMetadataIndex(
-                    NonMaxU32::new(1).expect("metadata index"),
-                ),
-                bind_group: binding,
-                bin_count,
-                mesh_instance_count: instances.len() as u32,
-            };
+            let bindings: Vec<_> = (0..block_count)
+                .map(|block| ViewPhaseSceneUnpackingBindGroup {
+                    metadata_index: SceneUnpackingMetadataIndex(
+                        NonMaxU32::new(
+                            ((block + 1) * SCENE_UNPACKING_WORKGROUPS_PER_DISPATCH) as u32,
+                        )
+                        .expect("metadata block index"),
+                    ),
+                    bind_group: binding.clone(),
+                    workgroup_count: if bin_workgroups > 1 {
+                        chunks_per_job
+                    } else {
+                        (descriptor_count
+                            - (block * SCENE_UNPACKING_WORKGROUPS_PER_DISPATCH) as u32)
+                            .min(SCENE_UNPACKING_WORKGROUPS_PER_DISPATCH as u32)
+                    },
+                    bin_workgroup_count: bin_workgroups,
+                })
+                .collect();
             let indirect_size = (indirect_initial.len() * 4) as u64;
             let work_size = (work_initial.len() * 4) as u64;
+            let fan_size = (fan_initial.len() * 4) as u64;
             let readback = self.device.create_buffer(&BufferDescriptor {
                 label: Some("scene-unpacking readback"),
-                size: indirect_size + work_size,
+                size: indirect_size + work_size + fan_size,
                 usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
 
             for (base, batch) in [(100, 11), (1000, 22)] {
-                self.queue.write_buffer(
-                    &metadata,
-                    256,
-                    bytes_of(&GpuSceneUnpackingMetadata {
-                        batch_set_index: batch,
+                let mut descriptors = vec![
+                    GpuSceneUnpackingMetadata::zeroed();
+                    block_count * SCENE_UNPACKING_WORKGROUPS_PER_DISPATCH
+                ];
+                let mut descriptor_index = 0;
+                for job in 0..job_count {
+                    let descriptor = GpuSceneUnpackingMetadata {
+                        batch_set_index: batch + job * 100,
                         bin_count,
-                        first_indirect_parameters_index: 2,
-                        first_output_mesh_uniform_index: base,
-                        base_output_work_item_index: 3,
-                        base_indirect_parameters_index: 2,
+                        first_indirect_parameters_index: 2 + job * bin_count * 2,
+                        first_output_mesh_uniform_index: base + job * 10_000,
+                        base_output_work_item_index: 3 + job * instances.len() as u32,
+                        base_indirect_parameters_index: 2 + job * bin_count * 2,
                         binned_mesh_instance_count: instances.len() as u32,
-                        pad: [0; 57],
-                    }),
-                );
+                        source_base: source_bases[job as usize],
+                        source_instance_offset: bins.len() as u32,
+                        source_bin_map_offset: (bins.len() + instances.len() * 2) as u32,
+                        fan_base: 3,
+                        chunk_index: 0,
+                        pad: [0; 4],
+                    };
+                    if bin_workgroups > 1 {
+                        descriptors[0] = descriptor;
+                    } else {
+                        for chunk_index in 0..chunks_per_job {
+                            descriptors[descriptor_index] = GpuSceneUnpackingMetadata {
+                                chunk_index,
+                                ..descriptor
+                            };
+                            descriptor_index += 1;
+                        }
+                    }
+                }
+                self.queue
+                    .write_buffer(&metadata, block_size, cast_slice(&descriptors));
                 self.queue
                     .write_buffer(&indirect, 0, cast_slice(&indirect_initial));
                 self.queue.write_buffer(&work, 0, cast_slice(&work_initial));
@@ -3436,22 +3562,34 @@ mod tests {
                     .create_command_encoder(&CommandEncoderDescriptor::default());
                 {
                     let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
-                    dispatch_scene_unpacking(
-                        &mut pass,
-                        self.cache
-                            .get_compute_pipeline(self.pipelines[0])
-                            .expect("local scan"),
-                        self.cache
-                            .get_compute_pipeline(self.pipelines[1])
-                            .expect("global scan"),
-                        self.cache
-                            .get_compute_pipeline(self.pipelines[2])
-                            .expect("fan"),
-                        &bindings,
-                    );
+                    for bindings in &bindings {
+                        dispatch_scene_unpacking(
+                            &mut pass,
+                            self.cache
+                                .get_compute_pipeline(self.pipelines[0])
+                                .expect("local scan"),
+                            self.cache
+                                .get_compute_pipeline(self.pipelines[1])
+                                .expect("large local scan"),
+                            self.cache
+                                .get_compute_pipeline(self.pipelines[2])
+                                .expect("global scan"),
+                            self.cache
+                                .get_compute_pipeline(self.pipelines[3])
+                                .expect("fan"),
+                            bindings,
+                        );
+                    }
                 }
                 encoder.copy_buffer_to_buffer(&indirect, 0, &readback, 0, indirect_size);
                 encoder.copy_buffer_to_buffer(&work, 0, &readback, indirect_size, work_size);
+                encoder.copy_buffer_to_buffer(
+                    &fan,
+                    0,
+                    &readback,
+                    indirect_size + work_size,
+                    fan_size,
+                );
                 self.queue.submit([encoder.finish()]);
                 let slice = readback.slice(..);
                 let (sender, receiver) = mpsc::channel();
@@ -3469,36 +3607,55 @@ mod tests {
                     .get_mapped_range()
                     .expect("mapped scene-unpacking output");
                 let words: &[u32] = cast_slice(&mapped);
-                for &(bin, offset) in expected_allocations {
-                    let start = (2 + bin * 2) * 5;
-                    assert_eq!(
-                        &words[start..start + 5],
-                        &[base + offset, batch, 0, 0, 0],
-                        "bin {bin}, first uniform {base}"
-                    );
-                }
-                for bin in 0..counts.len() {
-                    let hole = (3 + bin * 2) * 5;
-                    assert_eq!(
-                        &words[hole..hole + 5],
-                        &[0xdead_beef; 5],
-                        "unused indirect slot"
-                    );
-                }
-                let work_words = &words[indirect_initial.len()..];
+                let work_words =
+                    &words[indirect_initial.len()..indirect_initial.len() + work_initial.len()];
                 assert_eq!(&work_words[..6], &[0xdead_beef; 6], "work-item prefix");
                 assert_eq!(
                     &work_words[work_words.len() - 6..],
                     &[0xdead_beef; 6],
                     "work-item suffix"
                 );
-                for &(index, expected) in expected_work_items {
-                    let start = (3 + index) * 2;
-                    assert_eq!(
-                        &work_words[start..start + 2],
-                        &expected,
-                        "work item {index}"
-                    );
+                let fan_words = &words[indirect_initial.len() + work_initial.len()..];
+                assert_eq!(&fan_words[..3], &[0xdead_beef; 3], "fan prefix");
+                assert_eq!(
+                    &fan_words[fan_words.len() - 3..],
+                    &[0xdead_beef; 3],
+                    "fan suffix"
+                );
+                for job in 0..job_count as usize {
+                    for &(bin, offset) in expected_allocations {
+                        let start = (2 + (job * counts.len() + bin) * 2) * 5;
+                        assert_eq!(
+                            &words[start..start + 5],
+                            &[
+                                base + job as u32 * 10_000 + offset,
+                                batch + job as u32 * 100,
+                                0,
+                                0,
+                                0
+                            ],
+                            "bin {bin}, first uniform {base}"
+                        );
+                    }
+                    for bin in 0..counts.len() {
+                        let hole = (3 + (job * counts.len() + bin) * 2) * 5;
+                        assert_eq!(
+                            &words[hole..hole + 5],
+                            &[0xdead_beef; 5],
+                            "unused indirect slot"
+                        );
+                    }
+                    for &(index, expected) in expected_work_items {
+                        let start = (3 + job * instances.len() + index) * 2;
+                        assert_eq!(
+                            &work_words[start..start + 2],
+                            &[
+                                expected[0] + job as u32 * 10_000,
+                                expected[1] + job as u32 * bin_count * 2
+                            ],
+                            "work item {index}"
+                        );
+                    }
                 }
                 drop(mapped);
                 readback.unmap();
@@ -3539,6 +3696,14 @@ mod tests {
             &single,
             &[(0, 0)],
             &[(0, [60_000, 2]), (256, [60_256, 2]), (4096, [64_096, 2])],
+        );
+
+        let many_instances: Vec<_> = (0..65_537).map(|index| [600_000 + index, 1]).collect();
+        gpu.run(
+            &[65_537],
+            &many_instances,
+            &[(0, 0)],
+            &[(0, [600_000, 2]), (65_536, [665_536, 2])],
         );
 
         for (count, allocations, work_items) in [
