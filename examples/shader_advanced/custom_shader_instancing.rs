@@ -10,7 +10,7 @@
 use bevy::core_pipeline::core_3d::TransparentSortingInfo3d;
 use bevy::pbr::{
     self, MeshInputUniform, MeshPipelineSystems, MeshUniform, SetMeshViewBindingArrayBindGroup,
-    ViewKeyCache,
+    SetMeshViewEmptyBindGroup, ViewKeyCache,
 };
 use bevy::{
     camera::visibility::NoFrustumCulling,
@@ -282,7 +282,8 @@ type DrawCustom = (
     SetItemPipeline,
     SetMeshViewBindGroup<0>,
     SetMeshViewBindingArrayBindGroup<1>,
-    SetMeshBindGroup<2>,
+    SetMeshViewEmptyBindGroup<2>,
+    SetMeshBindGroup<3>,
     DrawMeshInstanced,
 );
 

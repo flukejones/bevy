@@ -112,6 +112,9 @@ use bytemuck::{Pod, Zeroable};
 use nonmax::{NonMaxU16, NonMaxU32};
 use smallvec::SmallVec;
 
+/// Mesh instance, skinning, morph, and lightmap binding slot. Custom mesh shaders must use this slot.
+pub const MESH_BIND_GROUP_INDEX: usize = 3;
+
 /// Provides support for rendering 3D meshes.
 pub struct MeshRenderPlugin {
     /// Whether we're building [`MeshUniform`]s on GPU.
@@ -2767,9 +2770,9 @@ pub struct MeshPipeline {
     /// Use code like this in custom shaders:
     /// ```wesl
     /// @if(PER_OBJECT_BUFFER_BATCH_SIZE)
-    /// @group(1) @binding(0) var<uniform> mesh: array<Mesh, u32(constants::PER_OBJECT_BUFFER_BATCH_SIZE)>;
+    /// @group(3) @binding(0) var<uniform> mesh: array<Mesh, u32(constants::PER_OBJECT_BUFFER_BATCH_SIZE)>;
     /// @else
-    /// @group(1) @binding(0) var<storage> mesh: array<Mesh>;
+    /// @group(3) @binding(0) var<storage> mesh: array<Mesh>;
     /// ```
     pub per_object_buffer_batch_size: Option<u32>,
 
@@ -3493,6 +3496,7 @@ impl SpecializedMeshPipeline for MeshPipeline {
         let mut bind_group_layout = vec![
             bind_group_layout.main_layout.clone(),
             bind_group_layout.binding_array_layout.clone(),
+            bind_group_layout.empty_layout.clone(),
         ];
 
         if key.msaa_samples() > 1 {

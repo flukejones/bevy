@@ -10,7 +10,7 @@ use crate::{
     PrepassFragmentShader, PrepassOpaqueDepthOnlyDrawFunction, PrepassOpaqueDrawFunction,
     PrepassVertexShader, RenderLightmaps, RenderMaterialInstances, RenderMeshInstanceFlags,
     RenderMeshInstances, SetMaterialBindGroup, SetMeshBindGroup, ShadowView,
-    VISIBILITY_RANGES_BINDING_INDEX,
+    MATERIAL_BIND_GROUP_INDEX, MESH_BIND_GROUP_INDEX, VISIBILITY_RANGES_BINDING_INDEX,
 };
 use bevy_app::{App, Plugin, PreUpdate};
 use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Handle};
@@ -427,7 +427,7 @@ impl PrepassPipeline {
 
         shader_defs.push(ShaderDefVal::UInt(
             "MATERIAL_BIND_GROUP".into(),
-            crate::MATERIAL_BIND_GROUP_INDEX as u32,
+            MATERIAL_BIND_GROUP_INDEX as u32,
         ));
         // For directional light shadow map views, use unclipped depth via either the native GPU feature,
         // or emulated by setting depth in the fragment shader for GPUs that don't support it natively.
@@ -605,7 +605,7 @@ impl PrepassPipeline {
             &mut vertex_attributes,
             self.skins_use_uniform_buffers,
         );
-        bind_group_layouts.insert(2, bind_group);
+        bind_group_layouts.push(bind_group);
         let vertex_buffer_layout = layout.0.get_layout(&vertex_attributes)?;
         // Setup prepass fragment targets - normals in slot 0 (or None if not needed), motion vectors in slot 1
         let mut targets = prepass_target_descriptors(
@@ -1619,8 +1619,8 @@ pub type DrawPrepass = (
     SetItemPipeline,
     SetPrepassViewBindGroup<0>,
     SetPrepassViewEmptyBindGroup<1>,
-    SetMeshBindGroup<2>,
-    SetMaterialBindGroup<3>,
+    SetMaterialBindGroup<MATERIAL_BIND_GROUP_INDEX>,
+    SetMeshBindGroup<MESH_BIND_GROUP_INDEX>,
     DrawMesh,
 );
 
@@ -1628,7 +1628,7 @@ pub type DrawDepthOnlyPrepass = (
     SetItemPipeline,
     SetPrepassViewBindGroup<0>,
     SetPrepassViewEmptyBindGroup<1>,
-    SetMeshBindGroup<2>,
-    SetPrepassEmptyMaterialBindGroup<3>,
+    SetPrepassEmptyMaterialBindGroup<MATERIAL_BIND_GROUP_INDEX>,
+    SetMeshBindGroup<MESH_BIND_GROUP_INDEX>,
     DrawMesh,
 );

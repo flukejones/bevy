@@ -72,7 +72,7 @@ use core::{
 use smallvec::SmallVec;
 use tracing::error;
 
-pub const MATERIAL_BIND_GROUP_INDEX: usize = 3;
+pub const MATERIAL_BIND_GROUP_INDEX: usize = 2;
 
 /// Materials are used alongside [`MaterialPlugin`], [`Mesh3d`], and [`MeshMaterial3d`]
 /// to spawn entities that are rendered with a specific [`Material`] type. They serve as an easy to use high level
@@ -535,9 +535,8 @@ impl SpecializedMeshPipeline for MaterialPipelineSpecializer {
             descriptor.fragment.as_mut().unwrap().shader = fragment_shader.clone();
         }
 
-        descriptor
-            .layout
-            .insert(3, self.properties.material_layout.as_ref().unwrap().clone());
+        descriptor.layout[MATERIAL_BIND_GROUP_INDEX] =
+            self.properties.material_layout.as_ref().unwrap().clone();
 
         if key
             .mesh_key
@@ -589,8 +588,8 @@ pub type DrawMaterial = (
     SetItemPipeline,
     SetMeshViewBindGroup<0>,
     SetMeshViewBindingArrayBindGroup<1>,
-    SetMeshBindGroup<2>,
     SetMaterialBindGroup<MATERIAL_BIND_GROUP_INDEX>,
+    SetMeshBindGroup<MESH_BIND_GROUP_INDEX>,
     DrawMesh,
 );
 

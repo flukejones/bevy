@@ -173,8 +173,8 @@ impl<P: PhaseItem> DrawFunctions<P> {
 ///     SetItemPipeline,
 ///     SetMeshViewBindGroup<0>,
 ///     SetMeshViewBindingArrayBindGroup<1>,
-///     SetMeshBindGroup<2>,
-///     SetMaterialBindGroup<M, 3>,
+///     SetMaterialBindGroup<M, 2>,
+///     SetMeshBindGroup<3>,
 ///     DrawMesh,
 /// );
 /// ```
