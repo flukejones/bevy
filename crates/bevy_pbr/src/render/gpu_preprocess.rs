@@ -28,7 +28,7 @@ use bevy_ecs::{
     query::{Has, Or, With, Without},
     resource::Resource,
     schedule::{common_conditions::any_match_filter, IntoScheduleConfigs as _},
-    system::{Commands, Query, Res, ResMut},
+    system::{Commands, Local, Query, Res, ResMut},
     world::{FromWorld, World},
 };
 use bevy_log::warn_once;
@@ -73,6 +73,11 @@ use bevy_utils::{default, TypeIdHashMap};
 use bitflags::bitflags;
 use smallvec::{smallvec, SmallVec};
 use tracing::warn;
+
+mod bind_group_cache;
+
+use bind_group_cache::CachedPhaseBindGroups;
+pub use bind_group_cache::PreprocessBindGroupCache;
 
 use crate::{
     LightEntity, MeshCullingData, MeshCullingDataBuffer, MeshInputUniform, MeshUniform,
@@ -2247,9 +2252,13 @@ pub fn prepare_preprocess_bind_groups(
     view_uniforms: Res<ViewUniforms>,
     previous_view_uniforms: Res<PreviousViewUniforms>,
     pipelines: Res<PreprocessPipelines>,
-    mut bin_unpacking_bind_groups: ResMut<BinUnpackingBindGroups>,
-    mut uniform_allocation_bind_groups: ResMut<UniformAllocationBindGroups>,
+    (mut bin_unpacking_bind_groups, mut uniform_allocation_bind_groups, mut cache): (
+        ResMut<BinUnpackingBindGroups>,
+        ResMut<UniformAllocationBindGroups>,
+        Local<PreprocessBindGroupCache>,
+    ),
 ) {
+    cache.begin_frame();
     // Grab the `BatchedInstanceBuffers`.
     let BatchedInstanceBuffers {
         current_input_buffer: current_input_buffer_vec,
@@ -2263,6 +2272,13 @@ pub fn prepare_preprocess_bind_groups(
     ) else {
         bin_unpacking_bind_groups.clear();
         uniform_allocation_bind_groups.clear();
+        cache.clear();
+        for (view_entity, _) in &views {
+            commands
+                .entity(view_entity)
+                .remove::<PreprocessBindGroups>();
+        }
+        commands.remove_resource::<BuildIndirectParametersBindGroups>();
         return;
     };
 
@@ -2299,7 +2315,8 @@ pub fn prepare_preprocess_bind_groups(
             };
 
             // Create the `PreprocessBindGroupBuilder`.
-            let preprocess_bind_group_builder = PreprocessBindGroupBuilder {
+            let mut preprocess_bind_group_builder = PreprocessBindGroupBuilder {
+                cache: cache.phase(Some(view_entity), *phase_type_id),
                 view: view_entity,
                 late_indexed_indirect_parameters_buffer,
                 late_non_indexed_indirect_parameters_buffer,
@@ -2378,7 +2395,10 @@ pub fn prepare_preprocess_bind_groups(
             current_input_buffer,
             &indirect_parameters_buffers,
             &indirect_parameters_build_jobs,
+            &mut cache,
         );
+    } else {
+        commands.remove_resource::<BuildIndirectParametersBindGroups>();
     }
 
     prepare_scene_unpacking_bind_groups(
@@ -2392,11 +2412,13 @@ pub fn prepare_preprocess_bind_groups(
         &scene_unpacking_buffers,
         views.iter().map(|(_, view)| view.retained_view_entity),
     );
+    cache.end_frame();
 }
 
 /// A temporary structure that stores all the information needed to construct
 /// bind groups for the mesh preprocessing shader.
 struct PreprocessBindGroupBuilder<'a> {
+    cache: &'a mut CachedPhaseBindGroups,
     /// The render-world entity corresponding to the current view.
     view: Entity,
     /// The indirect compute dispatch parameters buffer for indexed meshes in
@@ -2442,7 +2464,7 @@ impl<'a> PreprocessBindGroupBuilder<'a> {
     /// Creates the bind groups for mesh preprocessing when GPU frustum culling
     /// and GPU occlusion culling are both disabled.
     fn create_direct_preprocess_bind_groups(
-        &self,
+        &mut self,
         work_item_buffer: &RawBufferVec<PreprocessWorkItem>,
     ) -> Option<PhasePreprocessBindGroups> {
         // Don't use `as_entire_binding()` here; the shader reads the array
@@ -2454,7 +2476,8 @@ impl<'a> PreprocessBindGroupBuilder<'a> {
         .ok();
 
         Some(PhasePreprocessBindGroups::Direct(
-            self.render_device.create_bind_group(
+            self.cache.prepare(
+                self.render_device,
                 "preprocess_direct_bind_group",
                 &self
                     .pipeline_cache
@@ -2480,7 +2503,7 @@ impl<'a> PreprocessBindGroupBuilder<'a> {
     /// Creates the bind groups for mesh preprocessing when GPU occlusion
     /// culling is enabled.
     fn create_indirect_occlusion_culling_preprocess_bind_groups(
-        &self,
+        &mut self,
         view_depth_pyramids: &Query<(&ViewDepthPyramid, &PreviousViewUniformOffset)>,
         indexed_work_item_buffer: &PartialBufferVec<PreprocessWorkItem>,
         non_indexed_work_item_buffer: &PartialBufferVec<PreprocessWorkItem>,
@@ -2527,7 +2550,7 @@ impl<'a> PreprocessBindGroupBuilder<'a> {
     /// Creates the bind group for the first phase of mesh preprocessing of
     /// indexed meshes when GPU occlusion culling is enabled.
     fn create_indirect_occlusion_culling_early_indexed_bind_group(
-        &self,
+        &mut self,
         view_depth_pyramid: &ViewDepthPyramid,
         previous_view_uniform_offset: &PreviousViewUniformOffset,
         indexed_work_item_buffer: &PartialBufferVec<PreprocessWorkItem>,
@@ -2562,7 +2585,8 @@ impl<'a> PreprocessBindGroupBuilder<'a> {
                 .ok();
 
                 Some(
-                    self.render_device.create_bind_group(
+                    self.cache.prepare(
+                        self.render_device,
                         "preprocess_early_indexed_gpu_occlusion_culling_bind_group",
                         &self.pipeline_cache.get_bind_group_layout(
                             &self
@@ -2650,7 +2674,7 @@ impl<'a> PreprocessBindGroupBuilder<'a> {
     /// Creates the bind group for the first phase of mesh preprocessing of
     /// non-indexed meshes when GPU occlusion culling is enabled.
     fn create_indirect_occlusion_culling_early_non_indexed_bind_group(
-        &self,
+        &mut self,
         view_depth_pyramid: &ViewDepthPyramid,
         previous_view_uniform_offset: &PreviousViewUniformOffset,
         non_indexed_work_item_buffer: &PartialBufferVec<PreprocessWorkItem>,
@@ -2685,7 +2709,8 @@ impl<'a> PreprocessBindGroupBuilder<'a> {
                 .ok();
 
                 Some(
-                    self.render_device.create_bind_group(
+                    self.cache.prepare(
+                        self.render_device,
                         "preprocess_early_non_indexed_gpu_occlusion_culling_bind_group",
                         &self.pipeline_cache.get_bind_group_layout(
                             &self
@@ -2771,7 +2796,7 @@ impl<'a> PreprocessBindGroupBuilder<'a> {
     /// Creates the bind group for the second phase of mesh preprocessing of
     /// indexed meshes when GPU occlusion culling is enabled.
     fn create_indirect_occlusion_culling_late_indexed_bind_group(
-        &self,
+        &mut self,
         view_depth_pyramid: &ViewDepthPyramid,
         previous_view_uniform_offset: &PreviousViewUniformOffset,
         late_indexed_work_item_buffer: &UninitBufferVec<PreprocessWorkItem>,
@@ -2803,7 +2828,8 @@ impl<'a> PreprocessBindGroupBuilder<'a> {
                 .ok();
 
                 Some(
-                    self.render_device.create_bind_group(
+                    self.cache.prepare(
+                        self.render_device,
                         "preprocess_late_indexed_gpu_occlusion_culling_bind_group",
                         &self.pipeline_cache.get_bind_group_layout(
                             &self
@@ -2880,7 +2906,7 @@ impl<'a> PreprocessBindGroupBuilder<'a> {
     /// Creates the bind group for the second phase of mesh preprocessing of
     /// non-indexed meshes when GPU occlusion culling is enabled.
     fn create_indirect_occlusion_culling_late_non_indexed_bind_group(
-        &self,
+        &mut self,
         view_depth_pyramid: &ViewDepthPyramid,
         previous_view_uniform_offset: &PreviousViewUniformOffset,
         late_non_indexed_work_item_buffer: &UninitBufferVec<PreprocessWorkItem>,
@@ -2912,7 +2938,8 @@ impl<'a> PreprocessBindGroupBuilder<'a> {
                 .ok();
 
                 Some(
-                    self.render_device.create_bind_group(
+                    self.cache.prepare(
+                        self.render_device,
                         "preprocess_late_non_indexed_gpu_occlusion_culling_bind_group",
                         &self.pipeline_cache.get_bind_group_layout(
                             &self
@@ -2989,7 +3016,7 @@ impl<'a> PreprocessBindGroupBuilder<'a> {
     /// Creates the bind groups for mesh preprocessing when GPU frustum culling
     /// is enabled, but GPU occlusion culling is disabled.
     fn create_indirect_frustum_culling_preprocess_bind_groups(
-        &self,
+        &mut self,
         indexed_work_item_buffer: &PartialBufferVec<PreprocessWorkItem>,
         non_indexed_work_item_buffer: &PartialBufferVec<PreprocessWorkItem>,
     ) -> Option<PhasePreprocessBindGroups> {
@@ -3005,7 +3032,7 @@ impl<'a> PreprocessBindGroupBuilder<'a> {
     /// Creates the bind group for mesh preprocessing of indexed meshes when GPU
     /// frustum culling is enabled, but GPU occlusion culling is disabled.
     fn create_indirect_frustum_culling_indexed_bind_group(
-        &self,
+        &mut self,
         indexed_work_item_buffer: &PartialBufferVec<PreprocessWorkItem>,
     ) -> Option<BindGroup> {
         let mesh_culling_data_buffer = self.mesh_culling_data_buffer.buffer()?;
@@ -3029,7 +3056,8 @@ impl<'a> PreprocessBindGroupBuilder<'a> {
                 .ok();
 
                 Some(
-                    self.render_device.create_bind_group(
+                    self.cache.prepare(
+                        self.render_device,
                         "preprocess_gpu_indexed_frustum_culling_bind_group",
                         &self.pipeline_cache.get_bind_group_layout(
                             &self
@@ -3064,7 +3092,7 @@ impl<'a> PreprocessBindGroupBuilder<'a> {
     /// Creates the bind group for mesh preprocessing of non-indexed meshes when
     /// GPU frustum culling is enabled, but GPU occlusion culling is disabled.
     fn create_indirect_frustum_culling_non_indexed_bind_group(
-        &self,
+        &mut self,
         non_indexed_work_item_buffer: &PartialBufferVec<PreprocessWorkItem>,
     ) -> Option<BindGroup> {
         let mesh_culling_data_buffer = self.mesh_culling_data_buffer.buffer()?;
@@ -3088,7 +3116,8 @@ impl<'a> PreprocessBindGroupBuilder<'a> {
                 .ok();
 
                 Some(
-                    self.render_device.create_bind_group(
+                    self.cache.prepare(
+                        self.render_device,
                         "preprocess_gpu_non_indexed_frustum_culling_bind_group",
                         &self.pipeline_cache.get_bind_group_layout(
                             &self
@@ -3148,10 +3177,12 @@ fn create_build_indirect_parameters_bind_groups(
     current_input_buffer: &Buffer,
     indirect_parameters_buffers: &IndirectParametersBuffers,
     indirect_parameters_build_jobs: &IndirectParametersBuildJobs,
+    cache: &mut PreprocessBindGroupCache,
 ) {
     let mut build_indirect_parameters_bind_groups = BuildIndirectParametersBindGroups::new();
 
     for (phase_type_id, phase_indirect_parameters_buffer) in indirect_parameters_buffers.iter() {
+        let phase_cache = cache.phase(None, *phase_type_id);
         build_indirect_parameters_bind_groups.insert(
             *phase_type_id,
             PhaseBuildIndirectParametersBindGroups {
@@ -3159,7 +3190,8 @@ fn create_build_indirect_parameters_bind_groups(
                     .indexed
                     .batch_sets_buffer()
                     .map(|indexed_batch_sets_buffer| {
-                        render_device.create_bind_group(
+                        phase_cache.prepare(
+                            render_device,
                             "reset_indexed_indirect_batch_sets_bind_group",
                             // The early bind group is good for the main phase and late
                             // phase too. They bind the same buffers.
@@ -3179,7 +3211,8 @@ fn create_build_indirect_parameters_bind_groups(
                     .non_indexed
                     .batch_sets_buffer()
                     .map(|non_indexed_batch_sets_buffer| {
-                        render_device.create_bind_group(
+                        phase_cache.prepare(
+                            render_device,
                             "reset_non_indexed_indirect_batch_sets_bind_group",
                             // The early bind group is good for the main phase and late
                             // phase too. They bind the same buffers.
@@ -3207,7 +3240,8 @@ fn create_build_indirect_parameters_bind_groups(
                         Some(indexed_batch_sets_buffer),
                         Some(indirect_parameters_build_job_buffer),
                     ) => Some(
-                        render_device.create_bind_group(
+                        phase_cache.prepare(
+                            render_device,
                             "build_indexed_indirect_parameters_bind_group",
                             // The frustum culling bind group is good for occlusion culling
                             // too. They bind the same buffers.
@@ -3273,7 +3307,8 @@ fn create_build_indirect_parameters_bind_groups(
                         Some(non_indexed_batch_sets_buffer),
                         Some(indirect_parameters_build_job_buffer),
                     ) => Some(
-                        render_device.create_bind_group(
+                        phase_cache.prepare(
+                            render_device,
                             "build_non_indexed_indirect_parameters_bind_group",
                             // The frustum culling bind group is good for occlusion culling
                             // too. They bind the same buffers.
