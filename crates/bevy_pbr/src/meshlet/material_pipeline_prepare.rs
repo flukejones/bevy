@@ -205,13 +205,13 @@ pub fn prepare_material_meshlet_meshes_main_opaque_pass(
                 let layout = vec![
                     layout.main_layout,
                     layout.binding_array_layout,
-                    resource_manager.material_shade_bind_group_layout.clone(),
                     material
                         .properties
                         .material_layout
                         .as_ref()
                         .unwrap()
                         .clone(),
+                    resource_manager.material_shade_bind_group_layout.clone(),
                 ];
 
                 let pipeline_descriptor = RenderPipelineDescriptor {
@@ -406,13 +406,13 @@ pub fn prepare_material_meshlet_meshes_prepass(
                     layout: vec![
                         view_layout,
                         prepass_pipeline.empty_layout.clone(),
-                        resource_manager.material_shade_bind_group_layout.clone(),
                         material
                             .properties
                             .material_layout
                             .as_ref()
                             .unwrap()
                             .clone(),
+                        resource_manager.material_shade_bind_group_layout.clone(),
                     ],
                     vertex: VertexState {
                         shader: meshlet_pipelines.meshlet_mesh_material.clone(),

@@ -232,8 +232,8 @@ impl SpecializedMeshPipeline for StencilPipeline {
                 // Bind group 0 is the view uniform
                 view_layout.main_layout,
                 // Bind group 1 is empty
+                view_layout.empty_layout.clone(),
                 view_layout.empty_layout,
-                // Bind group 2 is the mesh uniform
                 self.mesh_pipeline.mesh_layouts.model_only.clone(),
             ],
             vertex: VertexState {
@@ -272,8 +272,8 @@ type DrawMesh3dStencil = (
     SetMeshViewBindGroup<0>,
     // This will set an empty bind group in group 1
     SetMeshViewEmptyBindGroup<1>,
-    // This will set the mesh bindings in group 2
-    SetMeshBindGroup<2>,
+    SetMeshViewEmptyBindGroup<2>,
+    SetMeshBindGroup<3>,
     // This will draw the mesh
     DrawMesh,
 );
