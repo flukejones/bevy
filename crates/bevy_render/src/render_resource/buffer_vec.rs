@@ -45,7 +45,6 @@ pub struct RawBufferVec<T: NoUninit> {
     buffer_usage: BufferUsages,
     label: Option<String>,
     changed: bool,
-    values_changed: bool,
 }
 
 impl<T: NoUninit> RawBufferVec<T> {
@@ -59,7 +58,6 @@ impl<T: NoUninit> RawBufferVec<T> {
             buffer_usage,
             label: None,
             changed: false,
-            values_changed: false,
         }
     }
 
@@ -99,13 +97,10 @@ impl<T: NoUninit> RawBufferVec<T> {
     pub fn push(&mut self, value: T) -> usize {
         let index = self.values.len();
         self.values.push(value);
-        self.values_changed = true;
         index
     }
 
     pub fn append(&mut self, other: &mut RawBufferVec<T>) {
-        self.values_changed |= !other.is_empty();
-        other.values_changed |= !other.is_empty();
         self.values.append(&mut other.values);
     }
 
@@ -119,7 +114,6 @@ impl<T: NoUninit> RawBufferVec<T> {
     /// The index must be less than [`RawBufferVec::len`].
     pub fn set(&mut self, index: u32, value: T) {
         self.values[index as usize] = value;
-        self.values_changed = true;
     }
 
     /// Preallocates space for `count` elements in the internal CPU-side buffer.
@@ -170,7 +164,6 @@ impl<T: NoUninit> RawBufferVec<T> {
                 mapped_at_creation: false,
             }));
             self.changed = false;
-            self.values_changed = true;
         }
     }
 
@@ -188,27 +181,6 @@ impl<T: NoUninit> RawBufferVec<T> {
             let range = 0..self.item_size * self.values.len();
             let bytes: &[u8] = must_cast_slice(&self.values);
             queue.write_buffer(buffer, 0, &bytes[range]);
-            self.values_changed = false;
-        }
-    }
-
-    /// Uploads CPU-authored data only after mutation or backing-buffer replacement.
-    /// The callback must encode the complete upload before the buffer's consumers.
-    /// GPU-written contents are not tracked; use [`Self::write_buffer`] to reset them.
-    pub(crate) fn write_buffer_if_changed(
-        &mut self,
-        device: &RenderDevice,
-        write: impl FnOnce(&Buffer, &[u8]),
-    ) {
-        if self.values.is_empty() {
-            return;
-        }
-        self.reserve(self.values.len(), device);
-        if self.values_changed
-            && let Some(buffer) = &self.buffer
-        {
-            write(buffer, must_cast_slice(&self.values));
-            self.values_changed = false;
         }
     }
 
@@ -244,25 +216,20 @@ impl<T: NoUninit> RawBufferVec<T> {
 
     /// Reduces the length of the buffer.
     pub fn truncate(&mut self, len: usize) {
-        self.values_changed |= len < self.values.len();
         self.values.truncate(len);
     }
 
     /// Removes all elements from the buffer.
     pub fn clear(&mut self) {
-        self.values_changed |= !self.values.is_empty();
         self.values.clear();
     }
 
     /// Removes and returns the last element in the buffer.
     pub fn pop(&mut self) -> Option<T> {
-        let value = self.values.pop();
-        self.values_changed |= value.is_some();
-        value
+        self.values.pop()
     }
 
     pub fn swap_remove(&mut self, index: usize) -> T {
-        self.values_changed = true;
         self.values.swap_remove(index)
     }
 
@@ -271,7 +238,6 @@ impl<T: NoUninit> RawBufferVec<T> {
     }
 
     pub fn values_mut(&mut self) -> &mut Vec<T> {
-        self.values_changed = true;
         &mut self.values
     }
 }
@@ -282,7 +248,6 @@ where
 {
     pub fn grow_set(&mut self, index: u32, value: T) {
         self.values.reserve(index as usize + 1);
-        self.values_changed = true;
         while index as usize + 1 > self.len() {
             self.values.push(T::default());
         }
@@ -293,7 +258,6 @@ where
 impl<T: NoUninit> Extend<T> for RawBufferVec<T> {
     #[inline]
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
-        self.values_changed = true;
         self.values.extend(iter);
     }
 }
@@ -1039,22 +1003,10 @@ pub(crate) fn make_buffer_label<'a, T>(label: &'a Option<String>) -> Option<&'a 
 
 #[cfg(test)]
 mod tests {
-    use super::{RawBufferVec, UninitBufferVec};
-    use crate::{
-        render_resource::Buffer,
-        renderer::{RenderDevice, RenderInstance, RenderQueue},
-    };
+    use super::UninitBufferVec;
     use bevy_math::Vec3;
-    use bevy_platform::future::block_on;
-    use bytemuck::cast_slice;
-    use core::iter::once_with;
     use encase::ShaderType;
-    use std::{
-        panic::{catch_unwind, AssertUnwindSafe},
-        sync::mpsc::channel,
-        time::Duration,
-    };
-    use wgpu::{BufferDescriptor, BufferUsages, DeviceDescriptor, MapMode, PollType};
+    use wgpu::BufferUsages;
 
     #[derive(ShaderType, Clone)]
     struct Padded {
@@ -1067,130 +1019,5 @@ mod tests {
         assert_eq!(size_of::<Padded>(), 12);
         let buffer = UninitBufferVec::<Padded>::new(BufferUsages::STORAGE);
         assert_eq!(buffer.item_size, 16);
-    }
-
-    #[test]
-    #[ignore = "requires a graphics adapter"]
-    fn cached_uploads_track_mutations_and_backing_replacement() {
-        let instance = RenderInstance::new(Default::default());
-        let adapter = block_on(instance.request_adapter(&Default::default()))
-            .expect("graphics adapter for buffer uploads");
-        let (device, queue) = block_on(adapter.request_device(&DeviceDescriptor::default()))
-            .expect("device for buffer uploads");
-        let device = RenderDevice::new(device);
-        let queue = RenderQueue::new(queue);
-        let write = |buffer: &Buffer, bytes: &[u8]| queue.write_buffer(buffer, 0, bytes);
-        let mut values = RawBufferVec::new(BufferUsages::COPY_SRC);
-        values.extend([11u32, 29, 47]);
-        values.write_buffer_if_changed(&device, write);
-        let original = values.buffer().expect("initial uploaded buffer").clone();
-        assert_eq!(read_words(&device, &queue, &original, 3), [11, 29, 47]);
-
-        queue.write_buffer(&original, 0, cast_slice(&[101u32, 103, 107]));
-        values.write_buffer_if_changed(&device, |_, _| panic!("unchanged values were uploaded"));
-        assert_eq!(read_words(&device, &queue, &original, 3), [101, 103, 107]);
-
-        values.set(0, 13);
-        values.write_buffer_if_changed(&device, write);
-        assert_eq!(read_words(&device, &queue, &original, 3), [13, 29, 47]);
-        values.values_mut()[1] = 31;
-        values.write_buffer_if_changed(&device, write);
-        assert_eq!(read_words(&device, &queue, &original, 3), [13, 31, 47]);
-
-        values.reserve(6, &device);
-        values.write_buffer_if_changed(&device, write);
-        let grown = values.buffer().expect("grown uploaded buffer").clone();
-        assert_ne!(grown.id(), original.id());
-        assert_eq!(read_words(&device, &queue, &grown, 3), [13, 31, 47]);
-        assert_eq!(read_words(&device, &queue, &original, 3), [13, 31, 47]);
-
-        values.set_label(Some("replacement backing"));
-        values.write_buffer_if_changed(&device, write);
-        let replacement = values.buffer().expect("relabeled uploaded buffer").clone();
-        assert_ne!(replacement.id(), grown.id());
-        assert_eq!(read_words(&device, &queue, &replacement, 3), [13, 31, 47]);
-
-        values.swap_remove(0);
-        values.write_buffer_if_changed(&device, write);
-        assert_eq!(read_words(&device, &queue, &replacement, 2), [47, 31]);
-        values.pop();
-        values.write_buffer_if_changed(&device, write);
-        assert_eq!(read_words(&device, &queue, &replacement, 1), [47]);
-        let mut appended = RawBufferVec::new(BufferUsages::COPY_SRC);
-        appended.extend([53, 59]);
-        values.append(&mut appended);
-        values.write_buffer_if_changed(&device, write);
-        assert_eq!(read_words(&device, &queue, &replacement, 3), [47, 53, 59]);
-        values.push(61);
-        values.write_buffer_if_changed(&device, write);
-        let replacement = values.buffer().expect("appended uploaded buffer").clone();
-        assert_eq!(
-            read_words(&device, &queue, &replacement, 4),
-            [47, 53, 59, 61]
-        );
-        values.truncate(3);
-        values.write_buffer_if_changed(&device, write);
-        assert_eq!(read_words(&device, &queue, &replacement, 3), [47, 53, 59]);
-
-        values.clear();
-        values.write_buffer_if_changed(&device, |_, _| panic!("empty values were uploaded"));
-        values.grow_set(2, 71);
-        values.write_buffer_if_changed(&device, write);
-        assert_eq!(read_words(&device, &queue, &replacement, 3), [0, 0, 71]);
-
-        queue.write_buffer(&replacement, 0, cast_slice(&[73u32, 79, 83]));
-        values.write_buffer(&device, &queue);
-        assert_eq!(read_words(&device, &queue, &replacement, 3), [0, 0, 71]);
-        queue.write_buffer(&replacement, 0, cast_slice(&[79u32, 83, 89]));
-        values.write_buffer_if_changed(&device, |_, _| panic!("complete upload remained dirty"));
-        assert_eq!(read_words(&device, &queue, &replacement, 3), [79, 83, 89]);
-
-        catch_unwind(AssertUnwindSafe(|| {
-            values.extend(
-                [97].into_iter()
-                    .chain(once_with(|| panic!("failed source"))),
-            );
-        }))
-        .expect_err("source iterator fails after appending one value");
-        values.write_buffer_if_changed(&device, write);
-        assert_eq!(read_words(&device, &queue, &replacement, 4), [0, 0, 71, 97]);
-    }
-
-    fn read_words(
-        device: &RenderDevice,
-        queue: &RenderQueue,
-        buffer: &Buffer,
-        count: u64,
-    ) -> Vec<u32> {
-        let readback = device.create_buffer(&BufferDescriptor {
-            label: Some("buffer upload readback"),
-            size: count * 4,
-            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let mut encoder = device.create_command_encoder(&Default::default());
-        encoder.copy_buffer_to_buffer(buffer, 0, &readback, 0, count * 4);
-        queue.submit([encoder.finish()]);
-        let slice = readback.slice(..);
-        let (sender, receiver) = channel();
-        slice.map_async(MapMode::Read, move |result| {
-            sender
-                .send(result)
-                .expect("buffer upload readback receiver");
-        });
-        device
-            .poll(PollType::wait_indefinitely())
-            .expect("buffer upload GPU completion");
-        receiver
-            .recv_timeout(Duration::from_secs(10))
-            .expect("buffer upload readback callback")
-            .expect("mapped buffer upload readback");
-        let mapped = slice
-            .get_mapped_range()
-            .expect("buffer upload readback bytes");
-        let words = cast_slice(&mapped).to_vec();
-        drop(mapped);
-        readback.unmap();
-        words
     }
 }

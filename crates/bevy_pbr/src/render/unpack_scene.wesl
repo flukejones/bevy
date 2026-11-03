@@ -1,12 +1,9 @@
-//! Allocates contiguous mesh-uniform ranges and unpacks cached batch-set instances.
-//!
-//! Local scan and unpacking are independent, so one dispatch covers both their
-//! bin and instance ranges. Batch sets with more than 256 bins finish allocation
-//! with a global prefix scan and fan pass before mesh preprocessing.
+//! Unpacks shared cached sources and allocates contiguous mesh-uniform ranges.
+//! Small jobs share a dispatch; large scans synchronize through separate passes.
 
 import bevy_render::occlusion_culling::mesh_preprocess_types::{BinMetadata, IndirectParametersMetadata, PreprocessWorkItem};
 
-/// Current-frame ranges for one cached batch set.
+/// Current-frame source and output ranges for one job chunk.
 struct SceneUnpackingMetadata {
     /// The index of this batch set in the `IndirectBatchSet` array.
     ///
@@ -31,18 +28,22 @@ struct SceneUnpackingMetadata {
     base_indirect_parameters_index: u32,
     /// Number of cached mesh instances, independently of the bin count.
     binned_mesh_instance_count: u32,
-    pad_a: u32,
-    pad: array<vec4<u32>, 14u>,
+    source_base: u32,
+    source_instance_offset: u32,
+    source_bin_map_offset: u32,
+    fan_base: u32,
+    chunk_index: u32,
+    pad: vec4<u32>,
 };
 
 /// The number of threads in a workgroup.
-const WORKGROUP_SIZE: u32 = 256u;
+const WORKGROUP_SIZE: u32 = u32(constants::SCENE_UNPACKING_WORKGROUP_SIZE);
 
-@group(0) @binding(0) var<uniform> metadata: SceneUnpackingMetadata;
+@group(0) @binding(0) var<uniform> metadata_block:
+    array<SceneUnpackingMetadata, u32(constants::SCENE_UNPACKING_WORKGROUPS_PER_DISPATCH)>;
 
-/// Information for each bin, including the indirect parameters offset and the
-/// instance count.
-@group(0) @binding(1) var<storage> bin_metadata: array<BinMetadata>;
+/// Dense bin metadata, cached instances, then the stable sparse bin mapping.
+@group(0) @binding(1) var<storage> source_words: array<u32>;
 
 /// The array of indirect parameters metadata that we fill out, one for each
 /// batch.
@@ -60,64 +61,84 @@ struct BinnedMeshInstance {
     bin_index: u32,
 };
 
-@group(0) @binding(4) var<storage> binned_mesh_instances: array<BinnedMeshInstance>;
-@group(0) @binding(5) var<storage, read_write> preprocess_work_items: array<PreprocessWorkItem>;
-@group(0) @binding(6) var<storage> bin_index_to_bin_metadata_index: array<u32>;
+@group(0) @binding(4) var<storage, read_write> preprocess_work_items: array<PreprocessWorkItem>;
 
 /// Scratch memory that stores the prefix sum for every element in our chunk.
-var<workgroup> output_offsets: array<u32, 256>;
+var<workgroup> output_offsets: array<u32, WORKGROUP_SIZE>;
 
-@compute @workgroup_size(256, 1, 1)
+@compute @workgroup_size(WORKGROUP_SIZE, 1, 1)
 fn unpack_scene(
     @builtin(local_invocation_id) local_id: vec3<u32>,
-    @builtin(workgroup_id) group_id: vec3<u32>,
-    @builtin(global_invocation_id) global_id: vec3<u32>
+    @builtin(workgroup_id) group_id: vec3<u32>
 ) {
-    if (global_id.x < metadata.binned_mesh_instance_count) {
-        let instance = binned_mesh_instances[global_id.x];
-        let bin_metadata_index = bin_index_to_bin_metadata_index[instance.bin_index];
-        let output_index = metadata.base_output_work_item_index + global_id.x;
+    let metadata = metadata_block[group_id.x];
+    unpack_chunk(metadata, local_id.x, metadata.chunk_index);
+}
+
+@compute @workgroup_size(WORKGROUP_SIZE, 1, 1)
+fn unpack_large_scene(
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(workgroup_id) group_id: vec3<u32>
+) {
+    unpack_chunk(metadata_block[0], local_id.x, group_id.x);
+}
+
+fn unpack_chunk(metadata: SceneUnpackingMetadata, local_id: u32, chunk_index: u32) {
+    let block_start = chunk_index * WORKGROUP_SIZE;
+    let global_id = block_start + local_id;
+    if (global_id < metadata.binned_mesh_instance_count) {
+        let source = metadata.source_base + metadata.source_instance_offset + global_id * 2u;
+        let instance = BinnedMeshInstance(source_words[source], source_words[source + 1u]);
+        let bin_metadata_index = source_words[
+            metadata.source_base + metadata.source_bin_map_offset + instance.bin_index
+        ];
+        let output_index = metadata.base_output_work_item_index + global_id;
         preprocess_work_items[output_index].input_index = instance.input_uniform_index;
         preprocess_work_items[output_index].output_or_indirect_parameters_index =
             metadata.base_indirect_parameters_index +
-            bin_metadata[bin_metadata_index].indirect_parameters_offset;
+            source_bin(metadata, bin_metadata_index).indirect_parameters_offset;
     }
 
     // Every invocation in a workgroup takes the same allocation path. Extra
     // workgroups can still unpack instances after the last bin.
-    let block_start = group_id.x * WORKGROUP_SIZE;
     if (block_start >= metadata.bin_count) {
         return;
     }
     if (metadata.bin_count == 1u) {
-        if (local_id.x == 0u) {
-            write_indirect_metadata(0u, metadata.first_output_mesh_uniform_index);
+        if (local_id == 0u) {
+            write_indirect_metadata(metadata, 0u, metadata.first_output_mesh_uniform_index);
         }
         return;
     }
 
     let block_size = min(WORKGROUP_SIZE, metadata.bin_count - block_start);
-    if (local_id.x == 0u) {
-        output_offsets[0] = select(0u, metadata.first_output_mesh_uniform_index, group_id.x == 0u);
-    } else if (local_id.x < block_size) {
-        output_offsets[local_id.x] = bin_metadata[global_id.x - 1u].instance_count;
+    if (local_id == 0u) {
+        output_offsets[0] = select(0u, metadata.first_output_mesh_uniform_index, chunk_index == 0u);
+    } else if (local_id < block_size) {
+        output_offsets[local_id] = source_bin(metadata, global_id - 1u).instance_count;
     } else {
-        output_offsets[local_id.x] = 0u;
+        output_offsets[local_id] = 0u;
     }
     workgroupBarrier();
 
-    hillis_steele_scan(local_id.x, block_size);
-    if (local_id.x < block_size) {
-        write_indirect_metadata(global_id.x, output_offsets[local_id.x]);
+    hillis_steele_scan(local_id, block_size);
+    if (local_id < block_size) {
+        write_indirect_metadata(metadata, global_id, output_offsets[local_id]);
     }
-    if (local_id.x == block_size - 1u) {
-        fan_buffer[group_id.x] = output_offsets[local_id.x] + bin_metadata[global_id.x].instance_count;
+    if (metadata.bin_count > WORKGROUP_SIZE && local_id == block_size - 1u) {
+        fan_buffer[metadata.fan_base + chunk_index] = output_offsets[local_id] +
+            source_bin(metadata, global_id).instance_count;
     }
 }
 
-fn write_indirect_metadata(bin_index: u32, base_output_index: u32) {
+fn source_bin(metadata: SceneUnpackingMetadata, bin_index: u32) -> BinMetadata {
+    let source = metadata.source_base + bin_index * 3u;
+    return BinMetadata(source_words[source], source_words[source + 1u], source_words[source + 2u]);
+}
+
+fn write_indirect_metadata(metadata: SceneUnpackingMetadata, bin_index: u32, base_output_index: u32) {
     let index = metadata.first_indirect_parameters_index +
-        bin_metadata[bin_index].indirect_parameters_offset;
+        source_bin(metadata, bin_index).indirect_parameters_offset;
     indirect_parameters_metadata[index].base_output_index = base_output_index;
     indirect_parameters_metadata[index].batch_set_index = metadata.batch_set_index;
     indirect_parameters_metadata[index].mesh_index = 0u;
@@ -132,8 +153,9 @@ fn write_indirect_metadata(bin_index: u32, base_output_index: u32) {
 /// scans in order to compute the fan value going into each chunk.
 ///
 /// This step is omitted if there are 256 or fewer total draws.
-@compute @workgroup_size(256, 1, 1)
+@compute @workgroup_size(WORKGROUP_SIZE, 1, 1)
 fn allocate_global_scan(@builtin(local_invocation_id) local_id: vec3<u32>) {
+    let metadata = metadata_block[0];
     var sum = 0u;
     let chunk_count = div_ceil(metadata.bin_count, WORKGROUP_SIZE);
 
@@ -141,22 +163,18 @@ fn allocate_global_scan(@builtin(local_invocation_id) local_id: vec3<u32>) {
     // iteration of this loop covers 64K meshes, the fact that it's sequential
     // isn't going to be a problem in practice.
     for (var block_start = 0u; block_start < chunk_count; block_start += WORKGROUP_SIZE) {
-        // Set up the Hillis-Steele scan.
         let block_end = min(block_start + WORKGROUP_SIZE, chunk_count);
         let global_id = block_start + local_id.x;
         if (global_id < block_end) {
-            output_offsets[local_id.x] = fan_buffer[global_id];
+            output_offsets[local_id.x] = fan_buffer[metadata.fan_base + global_id];
         }
         workgroupBarrier();
 
-        // Perform the scan.
         hillis_steele_scan(local_id.x, WORKGROUP_SIZE);
 
-        // Write the value back.
-        // Note that we don't need a workgroup barrier here because
-        // `hillis_steele_scan` already did one.
+        // The scan's final barrier makes every prefix visible here.
         if (global_id < block_end) {
-            fan_buffer[global_id] = sum + output_offsets[local_id.x];
+            fan_buffer[metadata.fan_base + global_id] = sum + output_offsets[local_id.x];
         }
 
         // Save the sum coming out of this block for the next one.
@@ -172,21 +190,22 @@ fn allocate_global_scan(@builtin(local_invocation_id) local_id: vec3<u32>) {
 /// here than in step (1), because there's nothing to do for the first chunk.
 ///
 /// This step is omitted if there are 256 or fewer total draws.
-@compute @workgroup_size(256, 1, 1)
+@compute @workgroup_size(WORKGROUP_SIZE, 1, 1)
 fn allocate_fan(
     @builtin(workgroup_id) group_id: vec3<u32>,
     @builtin(global_invocation_id) global_id: vec3<u32>
 ) {
+    let metadata = metadata_block[0];
     let id = global_id.x + WORKGROUP_SIZE;
     let bin_count = metadata.bin_count;
     if (id >= bin_count) {
         return;
     }
 
-    let fan_value = fan_buffer[group_id.x];
+    let fan_value = fan_buffer[metadata.fan_base + group_id.x];
     let indirect_parameters_offset =
         metadata.first_indirect_parameters_index +
-        bin_metadata[id].indirect_parameters_offset;
+        source_bin(metadata, id).indirect_parameters_offset;
     indirect_parameters_metadata[indirect_parameters_offset].base_output_index += fan_value;
 }
 
