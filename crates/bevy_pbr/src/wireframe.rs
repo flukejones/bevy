@@ -3,7 +3,8 @@ use crate::{
     render::{PreprocessBindGroups, PreprocessPipelines},
     set_mesh_motion_vector_flags, DrawMesh, MeshPipeline, MeshPipelineKey, MeshPipelineSystems,
     RenderLightmaps, RenderMeshInstanceFlags, RenderMeshInstances, SetMeshBindGroup,
-    SetMeshViewBindGroup, SetMeshViewBindingArrayBindGroup, ViewKeyCache,
+    SetMeshViewBindGroup, SetMeshViewBindingArrayBindGroup, SetMeshViewEmptyBindGroup,
+    ViewKeyCache, MATERIAL_BIND_GROUP_INDEX, MESH_BIND_GROUP_INDEX,
 };
 use bevy_app::{App, Plugin, PostUpdate, Startup};
 use bevy_asset::{
@@ -550,7 +551,7 @@ impl<P: PhaseItem> RenderCommand<P> for SetWireframe3dWideBindGroup {
             return RenderCommandResult::Skip;
         };
 
-        pass.set_bind_group(3, bind_group, &[*dynamic_offset]);
+        pass.set_bind_group(MATERIAL_BIND_GROUP_INDEX, bind_group, &[*dynamic_offset]);
         RenderCommandResult::Success
     }
 }
@@ -678,7 +679,8 @@ pub type DrawWireframe3dThin = (
     SetItemPipeline,
     SetMeshViewBindGroup<0>,
     SetMeshViewBindingArrayBindGroup<1>,
-    SetMeshBindGroup<2>,
+    SetMeshViewEmptyBindGroup<MATERIAL_BIND_GROUP_INDEX>,
+    SetMeshBindGroup<MESH_BIND_GROUP_INDEX>,
     SetWireframe3dThinImmediates,
     DrawMesh,
 );
@@ -688,8 +690,8 @@ pub type DrawWireframe3dWide = (
     SetItemPipeline,
     SetMeshViewBindGroup<0>,
     SetMeshViewBindingArrayBindGroup<1>,
-    SetMeshBindGroup<2>,
     SetWireframe3dWideBindGroup,
+    SetMeshBindGroup<MESH_BIND_GROUP_INDEX>,
     SetWireframe3dWideImmediates,
     DrawWireframeMeshPulled,
 );
@@ -789,9 +791,8 @@ impl SpecializedMeshPipeline for Wireframe3dPipeline {
             };
             descriptor.immediate_size = 32; // color(16) + line_width(4) + smoothing(4) + pad(8)
 
-            descriptor
-                .layout
-                .push(self.wide_bind_group_layout_descriptor.clone());
+            descriptor.layout[MATERIAL_BIND_GROUP_INDEX] =
+                self.wide_bind_group_layout_descriptor.clone();
         } else {
             descriptor.label = Some("wireframe_3d_pipeline".into());
             descriptor.immediate_size = 16;

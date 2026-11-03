@@ -169,10 +169,9 @@ type DrawSpecializedPipelineCommands = (
     SetItemPipeline,
     // Set the view uniform at bind group 0
     SetMeshViewBindGroup<0>,
-    // Set an empty material bind group at bind group 1
     SetMeshViewEmptyBindGroup<1>,
-    // Set the mesh uniform at bind group 2
-    SetMeshBindGroup<2>,
+    SetMeshViewEmptyBindGroup<2>,
+    SetMeshBindGroup<3>,
     // Draw the mesh
     DrawMesh,
 );
@@ -248,6 +247,7 @@ impl SpecializedMeshPipeline for CustomMeshPipeline {
             label: Some("Specialized Mesh Pipeline".into()),
             layout: vec![
                 view_layout.main_layout,
+                view_layout.empty_layout.clone(),
                 view_layout.empty_layout,
                 self.mesh_pipeline.mesh_layouts.model_only.clone(),
             ],

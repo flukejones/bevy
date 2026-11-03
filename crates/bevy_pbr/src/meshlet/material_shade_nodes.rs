@@ -6,7 +6,9 @@ use super::{
     resource_manager::{MeshletViewBindGroups, MeshletViewResources},
     InstanceManager,
 };
-use crate::{MeshViewBindGroup, PrepassViewBindGroup};
+use crate::{
+    MeshViewBindGroup, PrepassViewBindGroup, MATERIAL_BIND_GROUP_INDEX, MESH_BIND_GROUP_INDEX,
+};
 use bevy_camera::MainPassResolutionOverride;
 use bevy_camera::Viewport;
 use bevy_core_pipeline::prepass::{
@@ -93,7 +95,11 @@ pub fn meshlet_main_opaque_pass(
         &mesh_view_bind_group.main_offsets,
     );
     render_pass.set_bind_group(1, &mesh_view_bind_group.binding_array, &[]);
-    render_pass.set_bind_group(2, meshlet_material_shade_bind_group, &[]);
+    render_pass.set_bind_group(
+        MESH_BIND_GROUP_INDEX,
+        meshlet_material_shade_bind_group,
+        &[],
+    );
 
     // 1 fullscreen triangle draw per material
     for (material_id, material_pipeline_id, material_bind_group) in meshlet_view_materials.iter() {
@@ -103,7 +109,7 @@ pub fn meshlet_main_opaque_pass(
         {
             let x = *material_id * 3;
             render_pass.set_render_pipeline(material_pipeline);
-            render_pass.set_bind_group(3, material_bind_group, &[]);
+            render_pass.set_bind_group(MATERIAL_BIND_GROUP_INDEX, material_bind_group, &[]);
             render_pass.draw(x..(x + 3), 0..1);
         }
     }
@@ -210,7 +216,11 @@ pub fn meshlet_prepass(
     }
 
     render_pass.set_bind_group(1, &prepass_view_bind_group.empty_bind_group, &[]);
-    render_pass.set_bind_group(2, meshlet_material_shade_bind_group, &[]);
+    render_pass.set_bind_group(
+        MESH_BIND_GROUP_INDEX,
+        meshlet_material_shade_bind_group,
+        &[],
+    );
 
     // 1 fullscreen triangle draw per material
     for (material_id, material_pipeline_id, material_bind_group) in meshlet_view_materials.iter() {
@@ -220,7 +230,7 @@ pub fn meshlet_prepass(
         {
             let x = *material_id * 3;
             render_pass.set_render_pipeline(material_pipeline);
-            render_pass.set_bind_group(2, material_bind_group, &[]);
+            render_pass.set_bind_group(MATERIAL_BIND_GROUP_INDEX, material_bind_group, &[]);
             render_pass.draw(x..(x + 3), 0..1);
         }
     }
@@ -332,7 +342,11 @@ pub fn meshlet_deferred_gbuffer_prepass(
     }
 
     render_pass.set_bind_group(1, &prepass_view_bind_group.empty_bind_group, &[]);
-    render_pass.set_bind_group(2, meshlet_material_shade_bind_group, &[]);
+    render_pass.set_bind_group(
+        MESH_BIND_GROUP_INDEX,
+        meshlet_material_shade_bind_group,
+        &[],
+    );
 
     // 1 fullscreen triangle draw per material
     for (material_id, material_pipeline_id, material_bind_group) in meshlet_view_materials.iter() {
@@ -342,7 +356,7 @@ pub fn meshlet_deferred_gbuffer_prepass(
         {
             let x = *material_id * 3;
             render_pass.set_render_pipeline(material_pipeline);
-            render_pass.set_bind_group(2, material_bind_group, &[]);
+            render_pass.set_bind_group(MATERIAL_BIND_GROUP_INDEX, material_bind_group, &[]);
             render_pass.draw(x..(x + 3), 0..1);
         }
     }
