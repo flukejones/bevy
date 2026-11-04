@@ -447,7 +447,7 @@ pub struct ViewPhaseSceneUnpackingBindGroup {
 #[derive(Clone)]
 struct CachedSceneUnpackingBindGroup {
     bind_group: BindGroup,
-    current: bool,
+    age: u8,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -3208,7 +3208,6 @@ fn create_build_indirect_parameters_bind_groups(
     commands.insert_resource(build_indirect_parameters_bind_groups);
 }
 
-/// Refreshes dispatch state and evicts bindings without a current-frame job.
 fn prepare_scene_unpacking_bind_groups(
     groups: &mut SceneUnpackingBindGroups,
     render_device: &RenderDevice,
@@ -3223,7 +3222,7 @@ fn prepare_scene_unpacking_bind_groups(
         phase.indexed.clear();
         phase.non_indexed.clear();
         for binding in phase.cache.values_mut() {
-            binding.current = false;
+            binding.age = binding.age.saturating_add(1);
         }
     }
     for view in views {
@@ -3239,7 +3238,10 @@ fn prepare_scene_unpacking_bind_groups(
         );
     }
     groups.retain(|_, phase| {
-        phase.cache.retain(|_, binding| binding.current);
+        // Phase instance and indirect parameter buffers alternate between two
+        // allocations. Keep the other frame's bind groups for their next use.
+        // The enclosing maps still remove inactive views and phases immediately.
+        phase.cache.retain(|_, binding| binding.age < 2);
         !phase.indexed.is_empty() || !phase.non_indexed.is_empty()
     });
 }
@@ -3343,9 +3345,9 @@ fn create_scene_unpacking_bind_groups(
                                 work_items.as_entire_binding(),
                             )),
                         ),
-                        current: false,
+                        age: 0,
                     });
-                binding.current = true;
+                binding.age = 0;
                 output.push(ViewPhaseSceneUnpackingBindGroup {
                     metadata_index: job.metadata_index,
                     bind_group: binding.bind_group.clone(),
@@ -3855,6 +3857,7 @@ mod scene_cache_tests {
     use core::{
         any::TypeId,
         iter::{empty, once, repeat_n},
+        mem,
     };
     use nonmax::NonMaxU32;
     use wgpu_types::DeviceDescriptor;
@@ -3890,20 +3893,12 @@ mod scene_cache_tests {
             app.insert_resource(PipelineCache::new(device.clone(), true))
                 .insert_resource(device)
                 .insert_resource(RenderQueue::new(queue))
-                .init_resource::<PreprocessPipelines>();
+                .init_resource::<PreprocessPipelines>()
+                .init_resource::<IndirectParametersBuffers>();
             let key = SceneUnpackingBuffersKey {
                 phase: TypeId::of::<()>(),
                 view: RetainedViewEntity::new(Entity::PLACEHOLDER.into(), None, 0),
             };
-            let mut indirect = UntypedPhaseIndirectParametersBuffers::new(false);
-            indirect.allocate(true, 2);
-            indirect.allocate(false, 2);
-            let mut indirect_buffers = IndirectParametersBuffers::default();
-            indirect_buffers.insert(key.phase, indirect);
-            app.insert_resource(indirect_buffers);
-            app.world_mut()
-                .run_system_once(write_indirect_parameters_buffers)
-                .unwrap();
             let scene = SceneUnpackingBuffers::from_world(app.world_mut());
             let mut fixture = Self {
                 app,
@@ -3912,18 +3907,64 @@ mod scene_cache_tests {
                 groups: default(),
                 key,
             };
-            let mut phase = UntypedPhaseBatchedInstanceBuffers::new();
-            let mut work_items = RawBufferVec::new(BufferUsages::STORAGE);
-            work_items.push(PreprocessWorkItem::default());
-            work_items.write_buffer(
-                fixture.app.world().resource(),
-                fixture.app.world().resource(),
-            );
-            phase
-                .work_item_buffers
-                .insert(key.view, PreprocessWorkItemBuffers::Direct(work_items));
+            let (phase, indirect) = fixture.outputs();
             fixture.phases.insert(key.phase, phase);
             fixture
+                .app
+                .world_mut()
+                .resource_mut::<IndirectParametersBuffers>()
+                .insert(key.phase, indirect);
+            fixture
+        }
+
+        fn outputs(
+            &self,
+        ) -> (
+            UntypedPhaseBatchedInstanceBuffers<MeshUniform>,
+            UntypedPhaseIndirectParametersBuffers,
+        ) {
+            let device = self.app.world().resource::<RenderDevice>();
+            let queue = self.app.world().resource::<RenderQueue>();
+            let work_items = || {
+                let mut buffer =
+                    PartialBufferVec::new(BufferUsages::STORAGE, "scene cache work items".into());
+                buffer.push_init(PreprocessWorkItem::default());
+                buffer.push_multiple_uninit(16);
+                buffer.write_buffer(device, queue);
+                buffer
+            };
+            let mut phase = UntypedPhaseBatchedInstanceBuffers::new();
+            phase.work_item_buffers.insert(
+                self.key.view,
+                PreprocessWorkItemBuffers::Indirect {
+                    indexed: work_items(),
+                    non_indexed: work_items(),
+                    gpu_occlusion_culling: None,
+                },
+            );
+            let mut indirect = UntypedPhaseIndirectParametersBuffers::new(false);
+            indirect.allocate(true, 16);
+            indirect.allocate(false, 16);
+            (phase, indirect)
+        }
+
+        fn swap_outputs(
+            &mut self,
+            phase: &mut UntypedPhaseBatchedInstanceBuffers<MeshUniform>,
+            indirect: &mut UntypedPhaseIndirectParametersBuffers,
+        ) {
+            mem::swap(
+                phase,
+                self.phases.get_mut(&self.key.phase).expect("active phase"),
+            );
+            mem::swap(
+                indirect,
+                self.app
+                    .world_mut()
+                    .resource_mut::<IndirectParametersBuffers>()
+                    .get_mut(&self.key.phase)
+                    .expect("active indirect outputs"),
+            );
         }
 
         fn buffer(&self, size: u64) -> Buffer {
@@ -3979,6 +4020,10 @@ mod scene_cache_tests {
         }
 
         fn prepare(&mut self, views: impl Iterator<Item = RetainedViewEntity>) {
+            self.app
+                .world_mut()
+                .run_system_once(write_indirect_parameters_buffers)
+                .expect("allocate current indirect metadata outputs");
             prepare_scene_unpacking_bind_groups(
                 &mut self.groups,
                 self.app.world().resource(),
@@ -3993,22 +4038,22 @@ mod scene_cache_tests {
 
         fn ids(&self, indexed: bool, buffer: BufferId) -> (BindGroupId, u32) {
             let phase = &self.groups[&self.key];
-            let groups = if indexed {
-                &phase.indexed
+            let jobs = &self.scene.view_phase_buffers[&self.key];
+            let (groups, jobs) = if indexed {
+                (&phase.indexed, &jobs.indexed_unpacking_jobs)
             } else {
-                &phase.non_indexed
+                (&phase.non_indexed, &jobs.non_indexed_unpacking_jobs)
             };
-            let id = phase
-                .cache
+            let metadata_index = jobs
                 .iter()
-                .find(|(key, _)| key.buffers[1] == buffer)
-                .expect("current cached source")
-                .1
-                .bind_group
-                .id();
+                .find(|job| job.source_buffer.id() == buffer)
+                .expect("current source job")
+                .metadata_index;
             let binding = groups
                 .iter()
-                .find(|binding| binding.bind_group.id() == id)
+                .find(|binding| {
+                    binding.metadata_index.uniform_offset() == metadata_index.uniform_offset()
+                })
                 .expect("current source dispatch");
             (
                 binding.bind_group.id(),
@@ -4075,7 +4120,7 @@ mod scene_cache_tests {
         fixture.set_jobs(vec![vanished], vec![]);
         fixture.prepare(once(view));
         let returned = fixture.ids(true, grown_buffer);
-        assert_ne!(returned.0, replaced.0);
+        assert_eq!(returned.0, replaced.0);
 
         fixture.prepare(empty());
         assert!(fixture.groups.is_empty());
@@ -4088,6 +4133,88 @@ mod scene_cache_tests {
             .clear();
         fixture.prepare(once(view));
         assert!(fixture.groups.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires a graphics adapter"]
+    fn scene_unpacking_cache_reuses_alternating_outputs_and_expires_unused_groups() {
+        let mut fixture = SceneUnpackingFixture::new();
+        let view = fixture.key.view;
+        let indexed = fixture.job();
+        let non_indexed = fixture.job();
+        let indexed_buffer = indexed.source_buffer.id();
+        let non_indexed_buffer = non_indexed.source_buffer.id();
+        fixture.set_jobs(vec![indexed], vec![non_indexed]);
+        fixture.prepare(once(view));
+        let first = [
+            fixture.ids(true, indexed_buffer),
+            fixture.ids(false, non_indexed_buffer),
+        ];
+        let (mut phase, mut indirect) = fixture.outputs();
+        fixture.swap_outputs(&mut phase, &mut indirect);
+        fixture.prepare(once(view));
+        let second = [
+            fixture.ids(true, indexed_buffer),
+            fixture.ids(false, non_indexed_buffer),
+        ];
+        assert_ne!(first[0].0, second[0].0);
+        assert_ne!(first[1].0, second[1].0);
+
+        fixture.swap_outputs(&mut phase, &mut indirect);
+        {
+            let jobs = fixture
+                .scene
+                .view_phase_buffers
+                .get_mut(&fixture.key)
+                .expect("current source jobs");
+            let indexed = &mut jobs.indexed_unpacking_jobs[0];
+            let non_indexed = &mut jobs.non_indexed_unpacking_jobs[0];
+            mem::swap(&mut indexed.metadata_index, &mut non_indexed.metadata_index);
+            indexed.workgroup_count = 5;
+            indexed.bin_workgroup_count = 2;
+            non_indexed.workgroup_count = 7;
+            non_indexed.bin_workgroup_count = 3;
+        }
+        fixture.prepare(once(view));
+        assert_eq!(fixture.ids(true, indexed_buffer), (first[0].0, 16_384));
+        assert_eq!(fixture.ids(false, non_indexed_buffer), (first[1].0, 0));
+        let current = &fixture.groups[&fixture.key];
+        assert_eq!([current.indexed.len(), current.non_indexed.len()], [1, 1]);
+        assert_eq!(
+            [
+                (
+                    current.indexed[0].workgroup_count,
+                    current.indexed[0].bin_workgroup_count
+                ),
+                (
+                    current.non_indexed[0].workgroup_count,
+                    current.non_indexed[0].bin_workgroup_count
+                ),
+            ],
+            [(5, 2), (7, 3)]
+        );
+        assert_eq!(current.cache.len(), 4);
+
+        fixture.swap_outputs(&mut phase, &mut indirect);
+        fixture.prepare(once(view));
+        assert_eq!(fixture.ids(true, indexed_buffer).0, second[0].0);
+        assert_eq!(fixture.ids(false, non_indexed_buffer).0, second[1].0);
+        fixture.prepare(once(view));
+        assert_eq!(fixture.groups[&fixture.key].cache.len(), 2);
+        fixture.swap_outputs(&mut phase, &mut indirect);
+        fixture.prepare(once(view));
+        assert_ne!(fixture.ids(true, indexed_buffer).0, first[0].0);
+        assert_ne!(fixture.ids(false, non_indexed_buffer).0, first[1].0);
+        assert_eq!(fixture.groups[&fixture.key].cache.len(), 4);
+
+        for _ in 0..4 {
+            let (mut phase, mut indirect) = fixture.outputs();
+            fixture.swap_outputs(&mut phase, &mut indirect);
+            fixture.prepare(once(view));
+            let current = &fixture.groups[&fixture.key];
+            assert_eq!(current.cache.len(), 4);
+            assert_eq!([current.indexed.len(), current.non_indexed.len()], [1, 1]);
+        }
     }
 
     #[test]
