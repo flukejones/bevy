@@ -525,113 +525,502 @@ impl<const N: usize> SceneUnpackingBindGroupCache<N> {
 #[cfg(test)]
 mod scene_unpacking_cache_tests {
     use super::*;
-    use bevy_platform::future::block_on;
+    use core::{any::TypeId, mem};
 
-    fn device() -> RenderDevice {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::NOOP,
-            flags: default(),
-            memory_budget_thresholds: default(),
-            display: None,
-            backend_options: wgpu::BackendOptions {
-                noop: wgpu::NoopBackendOptions {
-                    enable: true,
+    use bevy_asset::{AssetApp, AssetPlugin};
+    use bevy_ecs::{change_detection::Mut, system::RunSystemOnce};
+    use bevy_math::{Mat4, UVec4};
+    use bevy_platform::future::block_on;
+    use bevy_render::{
+        batching::gpu_preprocessing::{
+            write_batched_instance_buffers, write_indirect_parameters_buffers,
+            InstanceInputUniformBuffer, PreviousInstanceInputUniformBuffer,
+            ViewPhaseSceneUnpackingBuffers,
+        },
+        render_resource::{
+            init_sparse_buffer_update_bind_groups, init_sparse_buffer_update_pipelines,
+            BindGroupId, BufferDescriptor, BufferUsages, SparseBufferPlugin, TextureFormat,
+        },
+    };
+    use bevy_tasks::{AsyncComputeTaskPool, ComputeTaskPool, IoTaskPool, TaskPool};
+    use bevy_transform::components::GlobalTransform;
+    use nonmax::NonMaxU32;
+
+    use crate::MeshPipeline;
+
+    struct SceneUnpackingFixture {
+        app: App,
+        key: SceneUnpackingBuffersKey,
+        view: Entity,
+    }
+
+    impl SceneUnpackingFixture {
+        fn new() -> Self {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::NOOP,
+                flags: default(),
+                memory_budget_thresholds: default(),
+                display: None,
+                backend_options: wgpu::BackendOptions {
+                    noop: wgpu::NoopBackendOptions {
+                        enable: true,
+                        ..default()
+                    },
                     ..default()
                 },
+            });
+            let adapter = block_on(instance.request_adapter(&default()))
+                .expect("NOOP adapter must be available");
+            let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                required_limits: adapter.limits(),
                 ..default()
-            },
-        });
-        let adapter = block_on(instance.request_adapter(&default())).unwrap();
-        let (device, _) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            required_limits: adapter.limits(),
-            ..default()
-        }))
-        .unwrap();
-        RenderDevice::from(device)
-    }
-
-    fn exercise_cache<const N: usize>() {
-        let device = device();
-        let layout = device.create_bind_group_layout("cache test", &[]);
-        let create = || device.create_bind_group("cache test", &layout, &[]);
-        let mut cache = SceneUnpackingBindGroupCache::<N>::default();
-        let first = core::array::from_fn(|_| BufferId::new());
-        let second = core::array::from_fn(|_| BufferId::new());
-        let a = cache.get_or_create(first, create);
-        let b = cache.get_or_create(second, create);
-
-        // Reordering jobs must preserve their bind groups, independent of metadata offsets.
-        cache.begin_frame();
-        assert_eq!(
-            cache.get_or_create(second, || panic!("recreated unchanged group")),
-            b
-        );
-        assert_eq!(
-            cache.get_or_create(first, || panic!("recreated unchanged group")),
-            a
-        );
-        cache.finish_frame();
-        assert_eq!(cache.entries.len(), 2);
-
-        for key in [first, second, first, second] {
-            cache.begin_frame();
-            cache.get_or_create(key, || panic!("recreated alternating group"));
-            cache.finish_frame();
-            assert_eq!(cache.entries.len(), 2);
-        }
-
-        // Reallocation of any bound buffer must invalidate the group.
-        for binding in 0..N {
-            let mut changed = first;
-            changed[binding] = BufferId::new();
-            assert_ne!(cache.get_or_create(changed, create), a);
-        }
-
-        // Allow one frame of inactivity for alternating phase buffers.
-        cache.begin_frame();
-        assert_eq!(
-            cache.get_or_create(second, || panic!("recreated retained group")),
-            b
-        );
-        cache.finish_frame();
-        cache.begin_frame();
-        cache.get_or_create(second, || panic!("recreated alternating group"));
-        cache.finish_frame();
-        assert_eq!(cache.entries.len(), 1);
-        assert!(!cache.entries.contains_key(&first));
-        cache.begin_frame();
-        cache.finish_frame();
-        cache.begin_frame();
-        cache.finish_frame();
-        assert!(cache.entries.is_empty());
-    }
-
-    #[test]
-    fn bin_unpacking_cache_reuses_invalidates_and_evicts() {
-        exercise_cache::<5>();
-    }
-
-    #[test]
-    fn uniform_allocation_cache_reuses_invalidates_and_evicts() {
-        exercise_cache::<4>();
-    }
-
-    #[test]
-    fn metadata_bindings_use_dynamic_offsets() {
-        for entry in [
-            bin_unpacking_bind_group_layout_entries()[0],
-            uniform_allocation_bind_group_layout_entries()[0],
-        ] {
-            assert!(matches!(
-                entry.ty,
-                bevy_render::render_resource::BindingType::Buffer {
-                    has_dynamic_offset: true,
-                    ..
+            }))
+            .expect("NOOP device must be available");
+            let device = RenderDevice::from(device);
+            IoTaskPool::get_or_init(TaskPool::new);
+            AsyncComputeTaskPool::get_or_init(TaskPool::new);
+            ComputeTaskPool::get_or_init(TaskPool::new);
+            let mut app = App::new();
+            app.add_plugins(AssetPlugin::default())
+                .init_asset::<Shader>();
+            SparseBufferPlugin.build(&mut app);
+            GpuMeshPreprocessPlugin {
+                use_gpu_instance_buffer_builder: true,
+            }
+            .build(&mut app);
+            app.insert_resource(PipelineCache::new(device.clone(), true))
+                .insert_resource(device)
+                .insert_resource(RenderQueue::new(queue))
+                .init_resource::<PreprocessPipelines>()
+                .init_resource::<BatchedInstanceBuffers<MeshUniform, MeshInputUniform>>()
+                .init_resource::<IndirectParametersBuffers>()
+                .init_resource::<IndirectParametersBuildJobs>()
+                .init_resource::<SceneUnpackingBuffers>()
+                .init_resource::<MeshCullingDataBuffer>()
+                .init_resource::<RenderVisibilityRanges>()
+                .init_resource::<ViewUniforms>()
+                .init_resource::<PreviousViewUniforms>()
+                .init_resource::<BinUnpackingBindGroups>()
+                .init_resource::<UniformAllocationBindGroups>()
+                .init_resource::<SparseBufferUpdateJobs>()
+                .init_resource::<SpecializedComputePipelines<SparseBufferUpdatePipelines>>();
+            let world = app.world_mut();
+            world
+                .run_system_once(init_sparse_buffer_update_pipelines)
+                .expect("initialize sparse upload pipeline");
+            world
+                .run_system_once(init_sparse_buffer_update_bind_groups)
+                .expect("initialize sparse upload bindings");
+            {
+                let mut inputs =
+                    world.resource_mut::<BatchedInstanceBuffers<MeshUniform, MeshInputUniform>>();
+                inputs.current_input_buffer.ensure_nonempty();
+                inputs.previous_input_buffer.ensure_nonempty();
+            }
+            let view = world.spawn_empty().id();
+            let key = SceneUnpackingBuffersKey {
+                phase: TypeId::of::<()>(),
+                view: RetainedViewEntity::new(view.into(), None, 0),
+            };
+            world.entity_mut(view).insert(Self::view(key.view));
+            let mut fixture = Self { app, key, view };
+            let (phase, indirect) = fixture.outputs();
+            let indexed = fixture.job();
+            let non_indexed = fixture.job();
+            let world = fixture.app.world_mut();
+            world
+                .resource_mut::<BatchedInstanceBuffers<MeshUniform, MeshInputUniform>>()
+                .phase_instance_buffers
+                .insert(key.phase, phase);
+            world
+                .resource_mut::<IndirectParametersBuffers>()
+                .insert(key.phase, indirect);
+            {
+                let mut scene = world.resource_mut::<SceneUnpackingBuffers>();
+                scene.view_phase_buffers.insert(
+                    key,
+                    ViewPhaseSceneUnpackingBuffers {
+                        indexed_unpacking_jobs: vec![indexed],
+                        non_indexed_unpacking_jobs: vec![non_indexed],
+                    },
+                );
+                for _ in 0..4 {
+                    scene.bin_unpacking_metadata.push(default());
+                    scene
+                        .uniform_allocation_metadata
+                        .push(GpuUniformAllocationMetadata {
+                            batch_set_index: 0,
+                            bin_count: 1,
+                            first_indirect_parameters_index: 0,
+                            first_output_mesh_uniform_index: 0,
+                            pad: [0; 60],
+                        });
                 }
-            ));
+            }
+            fixture
         }
-        assert_eq!(size_of::<GpuBinUnpackingMetadata>() % 256, 0);
-        assert_eq!(size_of::<GpuUniformAllocationMetadata>() % 256, 0);
+
+        fn view(retained_view_entity: RetainedViewEntity) -> ExtractedView {
+            ExtractedView {
+                retained_view_entity,
+                clip_from_view: Mat4::IDENTITY,
+                world_from_view: GlobalTransform::IDENTITY,
+                clip_from_world: None,
+                target_format: TextureFormat::Rgba8Unorm,
+                viewport: UVec4::new(0, 0, 1, 1),
+                color_grading: default(),
+                invert_culling: false,
+            }
+        }
+
+        fn outputs(
+            &self,
+        ) -> (
+            UntypedPhaseBatchedInstanceBuffers<MeshUniform>,
+            UntypedPhaseIndirectParametersBuffers,
+        ) {
+            let mut phase = UntypedPhaseBatchedInstanceBuffers::new();
+            let work_items = || {
+                let mut buffer =
+                    PartialBufferVec::new(BufferUsages::STORAGE, "cache test work items".into());
+                buffer.push_init(PreprocessWorkItem::default());
+                buffer.push_multiple_uninit(15);
+                buffer
+            };
+            phase.work_item_buffers.insert(
+                self.key.view,
+                PreprocessWorkItemBuffers::Indirect {
+                    indexed: work_items(),
+                    non_indexed: work_items(),
+                    gpu_occlusion_culling: None,
+                },
+            );
+            let mut indirect = UntypedPhaseIndirectParametersBuffers::new(false);
+            indirect.allocate(true, 16);
+            indirect.allocate(false, 16);
+            (phase, indirect)
+        }
+
+        fn swap_outputs(
+            &mut self,
+            phase: &mut UntypedPhaseBatchedInstanceBuffers<MeshUniform>,
+            indirect: &mut UntypedPhaseIndirectParametersBuffers,
+        ) {
+            let world = self.app.world_mut();
+            mem::swap(
+                phase,
+                world
+                    .resource_mut::<BatchedInstanceBuffers<MeshUniform, MeshInputUniform>>()
+                    .phase_instance_buffers
+                    .get_mut(&self.key.phase)
+                    .expect("active phase"),
+            );
+            mem::swap(
+                indirect,
+                world
+                    .resource_mut::<IndirectParametersBuffers>()
+                    .get_mut(&self.key.phase)
+                    .expect("active indirect parameters"),
+            );
+        }
+
+        fn buffer(&self) -> Buffer {
+            self.app
+                .world()
+                .resource::<RenderDevice>()
+                .create_buffer(&BufferDescriptor {
+                    label: Some("cache test source"),
+                    size: 512,
+                    usage: BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                })
+        }
+
+        fn job(&self) -> SceneUnpackingJob {
+            SceneUnpackingJob {
+                render_binned_mesh_instance_buffer: self.buffer(),
+                bin_metadata_buffer: self.buffer(),
+                fan_buffer: self.buffer(),
+                bin_index_to_bin_metadata_index_buffer: self.buffer(),
+                bin_unpacking_metadata_index: BinUnpackingMetadataIndex(NonMaxU32::ZERO),
+                uniform_allocation_metadata_index: UniformAllocationMetadataIndex(NonMaxU32::ZERO),
+                mesh_instance_count: 1,
+                bin_count: 1,
+            }
+        }
+
+        fn prepare(&mut self) {
+            let world = self.app.world_mut();
+            world
+                .run_system_once(write_batched_instance_buffers::<MeshPipeline>)
+                .expect("upload mesh inputs, work items and scene metadata");
+            world
+                .run_system_once(write_indirect_parameters_buffers)
+                .expect("allocate indirect metadata outputs");
+            world
+                .run_system_once(prepare_preprocess_bind_groups)
+                .expect("prepare actual scene unpacking bind groups");
+        }
+
+        fn dispatches(&self) -> [(BindGroupId, u32, u32); 4] {
+            let bins = &self.app.world().resource::<BinUnpackingBindGroups>()[&self.key];
+            let uniforms = &self.app.world().resource::<UniformAllocationBindGroups>()[&self.key];
+            assert_eq!(
+                [
+                    bins.indexed.len(),
+                    bins.non_indexed.len(),
+                    uniforms.indexed.len(),
+                    uniforms.non_indexed.len()
+                ],
+                [1; 4]
+            );
+            [
+                (
+                    bins.indexed[0].bind_group.id(),
+                    bins.indexed[0].metadata_index.uniform_offset(),
+                    bins.indexed[0].mesh_instance_count,
+                ),
+                (
+                    bins.non_indexed[0].bind_group.id(),
+                    bins.non_indexed[0].metadata_index.uniform_offset(),
+                    bins.non_indexed[0].mesh_instance_count,
+                ),
+                (
+                    uniforms.indexed[0].bind_group.id(),
+                    uniforms.indexed[0].metadata_index.uniform_offset(),
+                    uniforms.indexed[0].bin_count,
+                ),
+                (
+                    uniforms.non_indexed[0].bind_group.id(),
+                    uniforms.non_indexed[0].metadata_index.uniform_offset(),
+                    uniforms.non_indexed[0].bin_count,
+                ),
+            ]
+        }
+
+        fn cache_counts(&self) -> [usize; 4] {
+            let bins = &self.app.world().resource::<BinUnpackingBindGroups>()[&self.key];
+            let uniforms = &self.app.world().resource::<UniformAllocationBindGroups>()[&self.key];
+            [
+                bins.indexed_cache.entries.len(),
+                bins.non_indexed_cache.entries.len(),
+                uniforms.indexed_cache.entries.len(),
+                uniforms.non_indexed_cache.entries.len(),
+            ]
+        }
+
+        fn assert_retired(&self) {
+            assert!(self
+                .app
+                .world()
+                .resource::<BinUnpackingBindGroups>()
+                .is_empty());
+            assert!(self
+                .app
+                .world()
+                .resource::<UniformAllocationBindGroups>()
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn preparation_reuses_alternating_outputs_and_retires_inactive_resources() {
+        let mut fixture = SceneUnpackingFixture::new();
+        fixture.prepare();
+        let first = fixture.dispatches().map(|(id, _, _)| id);
+        let (mut phase, mut indirect) = fixture.outputs();
+        fixture.swap_outputs(&mut phase, &mut indirect);
+        fixture.prepare();
+        let second = fixture.dispatches().map(|(id, _, _)| id);
+        for (a, b) in first.into_iter().zip(second) {
+            assert_ne!(a, b);
+        }
+
+        fixture.swap_outputs(&mut phase, &mut indirect);
+        {
+            let mut scene = fixture
+                .app
+                .world_mut()
+                .resource_mut::<SceneUnpackingBuffers>();
+            let jobs = scene
+                .view_phase_buffers
+                .get_mut(&fixture.key)
+                .expect("view jobs");
+            for (job, index, instances, bins) in [
+                (&mut jobs.indexed_unpacking_jobs[0], 2, 7, 3),
+                (&mut jobs.non_indexed_unpacking_jobs[0], 3, 9, 4),
+            ] {
+                job.bin_unpacking_metadata_index =
+                    BinUnpackingMetadataIndex(NonMaxU32::new(index).expect("small metadata index"));
+                job.uniform_allocation_metadata_index = UniformAllocationMetadataIndex(
+                    NonMaxU32::new(index).expect("small metadata index"),
+                );
+                job.mesh_instance_count = instances;
+                job.bin_count = bins;
+            }
+        }
+        fixture.prepare();
+        let current = fixture.dispatches();
+        assert_eq!(
+            current.map(|(id, _, _)| id),
+            first,
+            "A must survive the intervening B frame"
+        );
+        assert_eq!(
+            current.map(|(_, offset, count)| (offset, count)),
+            [(512, 7), (768, 9), (512, 3), (768, 4)]
+        );
+        assert_eq!(fixture.cache_counts(), [2; 4]);
+
+        fixture.swap_outputs(&mut phase, &mut indirect);
+        fixture.prepare();
+        assert_eq!(fixture.dispatches().map(|(id, _, _)| id), second);
+        fixture.prepare();
+        assert_eq!(fixture.cache_counts(), [1; 4], "two unused frames expire A");
+        fixture.swap_outputs(&mut phase, &mut indirect);
+        fixture.prepare();
+        for (old, (new, _, _)) in first.into_iter().zip(fixture.dispatches()) {
+            assert_ne!(old, new, "returning expired A must recreate its groups");
+        }
+        assert_eq!(fixture.cache_counts(), [2; 4]);
+
+        fixture
+            .app
+            .world_mut()
+            .entity_mut(fixture.view)
+            .remove::<ExtractedView>();
+        fixture.prepare();
+        fixture.assert_retired();
+        fixture
+            .app
+            .world_mut()
+            .entity_mut(fixture.view)
+            .insert(SceneUnpackingFixture::view(fixture.key.view));
+        fixture.prepare();
+        fixture.dispatches();
+
+        let world = fixture.app.world_mut();
+        let phase = world
+            .resource_mut::<BatchedInstanceBuffers<MeshUniform, MeshInputUniform>>()
+            .phase_instance_buffers
+            .remove(&fixture.key.phase)
+            .expect("active phase");
+        let indirect = world
+            .resource_mut::<IndirectParametersBuffers>()
+            .remove(&fixture.key.phase)
+            .expect("active indirect parameters");
+        fixture.prepare();
+        fixture.assert_retired();
+        let world = fixture.app.world_mut();
+        world
+            .resource_mut::<BatchedInstanceBuffers<MeshUniform, MeshInputUniform>>()
+            .phase_instance_buffers
+            .insert(fixture.key.phase, phase);
+        world
+            .resource_mut::<IndirectParametersBuffers>()
+            .insert(fixture.key.phase, indirect);
+        fixture.prepare();
+        fixture.dispatches();
+
+        let current = mem::replace(
+            &mut fixture
+                .app
+                .world_mut()
+                .resource_mut::<BatchedInstanceBuffers<MeshUniform, MeshInputUniform>>()
+                .current_input_buffer,
+            InstanceInputUniformBuffer::new(),
+        );
+        fixture
+            .app
+            .world_mut()
+            .run_system_once(prepare_preprocess_bind_groups)
+            .expect("retire caches with missing current mesh inputs");
+        fixture.assert_retired();
+        fixture
+            .app
+            .world_mut()
+            .resource_mut::<BatchedInstanceBuffers<MeshUniform, MeshInputUniform>>()
+            .current_input_buffer = current;
+        fixture.prepare();
+        fixture.dispatches();
+        let previous = mem::replace(
+            &mut fixture
+                .app
+                .world_mut()
+                .resource_mut::<BatchedInstanceBuffers<MeshUniform, MeshInputUniform>>()
+                .previous_input_buffer,
+            PreviousInstanceInputUniformBuffer::new(),
+        );
+        fixture
+            .app
+            .world_mut()
+            .run_system_once(prepare_preprocess_bind_groups)
+            .expect("retire caches with missing previous mesh inputs");
+        fixture.assert_retired();
+        fixture
+            .app
+            .world_mut()
+            .resource_mut::<BatchedInstanceBuffers<MeshUniform, MeshInputUniform>>()
+            .previous_input_buffer = previous;
+        fixture.prepare();
+        fixture.dispatches();
+    }
+
+    #[test]
+    fn preparation_invalidates_replaced_source_and_metadata_buffers() {
+        let mut fixture = SceneUnpackingFixture::new();
+        fixture.prepare();
+        for (binding, changes_bins, changes_uniforms) in [
+            (0, true, false),
+            (1, true, true),
+            (2, false, true),
+            (3, true, false),
+        ] {
+            let old = fixture.dispatches().map(|(id, _, _)| id);
+            let replacement = fixture.buffer();
+            {
+                let mut scene = fixture
+                    .app
+                    .world_mut()
+                    .resource_mut::<SceneUnpackingBuffers>();
+                let job = &mut scene
+                    .view_phase_buffers
+                    .get_mut(&fixture.key)
+                    .expect("view jobs")
+                    .indexed_unpacking_jobs[0];
+                match binding {
+                    0 => job.render_binned_mesh_instance_buffer = replacement,
+                    1 => job.bin_metadata_buffer = replacement,
+                    2 => job.fan_buffer = replacement,
+                    3 => job.bin_index_to_bin_metadata_index_buffer = replacement,
+                    _ => unreachable!(),
+                }
+            }
+            fixture.prepare();
+            let new = fixture.dispatches().map(|(id, _, _)| id);
+            assert_eq!(old[0] != new[0], changes_bins);
+            assert_eq!(old[2] != new[2], changes_uniforms);
+            assert_eq!([old[1], old[3]], [new[1], new[3]]);
+            assert!(fixture.cache_counts().into_iter().all(|count| count <= 2));
+        }
+        for grow_bins in [true, false] {
+            let old = fixture.dispatches().map(|(id, _, _)| id);
+            fixture.app.world_mut().resource_scope(
+                |world, mut scene: Mut<SceneUnpackingBuffers>| {
+                    let device = world.resource::<RenderDevice>();
+                    if grow_bins {
+                        scene.bin_unpacking_metadata.reserve(16, device);
+                    } else {
+                        scene.uniform_allocation_metadata.reserve(16, device);
+                    }
+                },
+            );
+            fixture.prepare();
+            let new = fixture.dispatches().map(|(id, _, _)| id);
+            assert_eq!([old[0] != new[0], old[1] != new[1]], [grow_bins; 2]);
+            assert_eq!([old[2] != new[2], old[3] != new[3]], [!grow_bins; 2]);
+            assert!(fixture.cache_counts().into_iter().all(|count| count <= 2));
+        }
     }
 }
 
