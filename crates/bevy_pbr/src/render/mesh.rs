@@ -45,9 +45,7 @@ use bevy_render::material_bind_groups::{
     MaterialBindGroupIndex, MaterialBindGroupSlot, MaterialBindingId, RenderMaterialBindings,
 };
 use bevy_render::mesh::allocator::{MeshSlabId, MeshSlabs};
-use bevy_render::mesh::morph::{
-    MorphTargetImage, MorphTargetsResource, RenderMorphTargetAllocator,
-};
+use bevy_render::mesh::morph::{MorphTargetsResource, RenderMorphTargetAllocator};
 use bevy_render::mesh::MeshMetadataFallbackBuffer;
 use bevy_render::{
     batching::{
@@ -3823,6 +3821,7 @@ pub struct MeshPhaseBindGroups {
         (MeshSlabId, LightmapSlabIndex),
         SmallVec<[LightmapMeshBindGroup; LIGHTMAP_MODEL_BUFFER_SETS]>,
     >,
+    geometry_cache: HashMap<MeshGeometrySlot, SmallVec<[CachedMeshGeometry; 2]>>,
 }
 
 struct LightmapMeshBindGroup {
@@ -3834,6 +3833,110 @@ struct LightmapMeshBindGroup {
     layout: BindGroupLayoutId,
     images: [Option<(TextureViewId, SamplerId)>; LIGHTMAPS_PER_SLAB],
     bindless: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum MeshGeometrySlot {
+    Model(MeshSlabId),
+    Skinned(MeshSlabId),
+    UniformMorph(AssetId<Mesh>),
+    StorageMorph((MeshSlabId, MeshSlabId), bool),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MeshMorphTargetIdentity {
+    Texture(TextureViewId),
+    Storage(BufferId),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MeshMorphResources {
+    weights: (BufferId, BufferId),
+    targets: MeshMorphTargetIdentity,
+    descriptors: Option<BufferId>,
+}
+
+#[derive(Clone, Copy)]
+struct MeshMorphBindings<'a> {
+    weights: (&'a Buffer, &'a Buffer),
+    targets: MorphTargetsResource<'a>,
+    descriptors: Option<&'a Buffer>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MeshGeometryResources {
+    layouts: [BindGroupLayoutId; 2],
+    metadata: BufferId,
+    skin: Option<(BufferId, BufferId)>,
+    morph: Option<MeshMorphResources>,
+}
+
+#[derive(Clone)]
+enum MeshGeometryBindGroup {
+    Model(BindGroup),
+    Deformed(MeshBindGroupPair),
+}
+
+struct CachedMeshGeometry {
+    model: Buffer,
+    offset: BufferAddress,
+    size: Option<BufferSize>,
+    resources: MeshGeometryResources,
+    groups: MeshGeometryBindGroup,
+    age: u8,
+}
+
+/// Reusable mesh-family requirements for bind-group preparation.
+#[derive(Default)]
+pub struct MeshBindGroupPreparation {
+    skinned_slabs: HashSet<MeshSlabId>,
+    morph_slab_pairs: HashMap<(MeshSlabId, MeshSlabId), bool>,
+}
+
+impl MeshBindGroupPreparation {
+    fn update(
+        &mut self,
+        meshes: &RenderAssets<RenderMesh>,
+        mesh_instances: &RenderMeshInstances,
+        skins: &SkinUniforms,
+        mesh_allocator: &MeshAllocator,
+        fallback_slab: MeshSlabId,
+        collect_storage_morphs: bool,
+    ) {
+        self.skinned_slabs.clear();
+        self.morph_slab_pairs.clear();
+        if collect_storage_morphs {
+            for (id, mesh) in meshes.iter() {
+                if !mesh.has_morph_targets() {
+                    continue;
+                }
+                let Some(slabs) = mesh_allocator.mesh_slabs(&id) else {
+                    continue;
+                };
+                if let Some(targets) = slabs.morph_target_slab_id {
+                    self.morph_slab_pairs.insert(
+                        (slabs.metadata_slab_id.unwrap_or(fallback_slab), targets),
+                        false,
+                    );
+                }
+            }
+        }
+        for entity in skins.all_skins() {
+            let Some(mesh) = mesh_instances.mesh_asset_id(*entity) else {
+                continue;
+            };
+            let slabs = mesh_allocator.mesh_slabs(&mesh);
+            let metadata = slabs
+                .and_then(|slabs| slabs.metadata_slab_id)
+                .unwrap_or(fallback_slab);
+            self.skinned_slabs.insert(metadata);
+            if collect_storage_morphs
+                && let Some(targets) = slabs.and_then(|slabs| slabs.morph_target_slab_id)
+            {
+                self.morph_slab_pairs.insert((metadata, targets), true);
+            }
+        }
+    }
 }
 
 /// Stores bind groups for each mesh with morph targets.
@@ -3880,6 +3983,7 @@ impl MeshMorphTargetBindGroups {
     }
 }
 
+#[derive(Clone)]
 pub struct MeshBindGroupPair {
     motion_vectors: BindGroup,
     no_motion_vectors: BindGroup,
@@ -3911,6 +4015,7 @@ impl MeshPhaseBindGroups {
                 MeshMorphTargetBindGroups::Storage(HashMap::default())
             },
             lightmaps: HashMap::default(),
+            geometry_cache: HashMap::default(),
         }
     }
 
@@ -3919,6 +4024,53 @@ impl MeshPhaseBindGroups {
         self.skinned.clear();
         self.morph_targets.clear();
         self.lightmaps.clear();
+        self.geometry_cache.clear();
+    }
+
+    fn begin_frame(&mut self, lightmap_pairs: &HashSet<(MeshSlabId, LightmapSlabIndex)>) {
+        self.model_only.clear();
+        self.skinned.clear();
+        self.morph_targets.clear();
+        self.lightmaps.retain(|key, _| lightmap_pairs.contains(key));
+        for cached in self.geometry_cache.values_mut().flatten() {
+            cached.age = cached.age.saturating_add(1);
+        }
+    }
+
+    fn finish_frame(&mut self) {
+        self.geometry_cache.retain(|_, variants| {
+            variants.retain(|cached| cached.age < 2);
+            !variants.is_empty()
+        });
+    }
+
+    fn prepare_geometry(
+        &mut self,
+        slot: MeshGeometrySlot,
+        model: &BufferBinding,
+        resources: MeshGeometryResources,
+        create: impl FnOnce() -> MeshGeometryBindGroup,
+    ) -> MeshGeometryBindGroup {
+        let variants = self.geometry_cache.entry(slot).or_default();
+        if let Some(cached) = variants.iter_mut().find(|cached| {
+            &*cached.model == model.buffer
+                && cached.offset == model.offset
+                && cached.size == model.size
+                && cached.resources == resources
+        }) {
+            cached.age = 0;
+            return cached.groups.clone();
+        }
+        let groups = create();
+        variants.push(CachedMeshGeometry {
+            model: model.buffer.clone().into(),
+            offset: model.offset,
+            size: model.size,
+            resources,
+            groups: groups.clone(),
+            age: 0,
+        });
+        groups
     }
 
     /// Get the appropriate `BindGroup` for `RenderMesh` with the given keys.
@@ -3982,13 +4134,6 @@ impl MeshPhaseBindGroups {
             }
         }
     }
-    fn begin_frame(&mut self, lightmap_pairs: &HashSet<(MeshSlabId, LightmapSlabIndex)>) {
-        self.model_only.clear();
-        self.skinned.clear();
-        self.morph_targets.clear();
-        self.lightmaps.retain(|key, _| lightmap_pairs.contains(key));
-    }
-
     fn prepare_lightmap(
         &mut self,
         key: (MeshSlabId, LightmapSlabIndex),
@@ -4092,7 +4237,7 @@ pub fn prepare_mesh_bind_groups(
     render_lightmaps: Res<RenderLightmaps>,
     metadata_fallback_buffer: Res<MeshMetadataFallbackBuffer>,
     mut mesh_bind_groups: Option<ResMut<MeshBindGroups>>,
-    mesh_instances: Res<RenderMeshInstances>,
+    (mesh_instances, mut preparation): (Res<RenderMeshInstances>, Local<MeshBindGroupPreparation>),
     mut lightmap_pairs: Local<HashSet<(MeshSlabId, LightmapSlabIndex)>>,
 ) {
     lightmap_pairs.clear();
@@ -4108,6 +4253,18 @@ pub fn prepare_mesh_bind_groups(
         lightmap_pairs.insert((metadata_slab, lightmap.slab_index));
     }
 
+    preparation.update(
+        &meshes,
+        &mesh_instances,
+        &skins_uniform,
+        &mesh_allocator,
+        metadata_fallback_buffer.slab_id,
+        weights_uniform.current_buffer.buffer().is_some()
+            && matches!(
+                *render_morph_target_allocator,
+                RenderMorphTargetAllocator::Storage
+            ),
+    );
     // CPU mesh preprocessing path.
     if let Some(cpu_batched_instance_buffer) = cpu_batched_instance_buffer
         && let Some(instance_data_binding) = cpu_batched_instance_buffer
@@ -4124,6 +4281,7 @@ pub fn prepare_mesh_bind_groups(
                 MeshPhaseBindGroups::new(&render_device),
             ),
         };
+
         // In this path, we only have a single set of bind groups for all phases.
         prepare_mesh_bind_groups_for_phase(
             &mut cpu_preprocessing_mesh_bind_groups,
@@ -4139,6 +4297,7 @@ pub fn prepare_mesh_bind_groups(
             &render_lightmaps,
             &metadata_fallback_buffer,
             &lightmap_pairs,
+            &preparation,
         );
 
         commands.insert_resource(MeshBindGroups::CpuPreprocessing(
@@ -4179,7 +4338,8 @@ pub fn prepare_mesh_bind_groups(
             };
             let groups = gpu_preprocessing_mesh_bind_groups
                 .entry(*phase_type_id)
-                .or_insert(MeshPhaseBindGroups::new(&render_device));
+                .or_insert_with(|| MeshPhaseBindGroups::new(&render_device));
+
             prepare_mesh_bind_groups_for_phase(
                 groups,
                 instance_data_binding,
@@ -4194,6 +4354,7 @@ pub fn prepare_mesh_bind_groups(
                 &render_lightmaps,
                 &metadata_fallback_buffer,
                 &lightmap_pairs,
+                &preparation,
             );
         }
 
@@ -4220,317 +4381,287 @@ fn prepare_mesh_bind_groups_for_phase(
     render_lightmaps: &RenderLightmaps,
     metadata_fallback_buffer: &MeshMetadataFallbackBuffer,
     lightmap_pairs: &HashSet<(MeshSlabId, LightmapSlabIndex)>,
+    preparation: &MeshBindGroupPreparation,
 ) {
-    let layouts = &mesh_pipeline.mesh_layouts;
     groups.begin_frame(lightmap_pairs);
+    let BindingResource::Buffer(model) = model else {
+        unreachable!("mesh instance data is a buffer binding");
+    };
+    let layouts = &mesh_pipeline.mesh_layouts;
+    let skin = (&skins_uniform.current_buffer, &skins_uniform.prev_buffer);
 
-    for metadata_slab_id in mesh_allocator.metadata_slabs() {
-        let metadata_buffer = mesh_allocator
-            .buffer_for_slab(metadata_slab_id)
+    for metadata_slab in mesh_allocator.metadata_slabs() {
+        let metadata = mesh_allocator
+            .buffer_for_slab(metadata_slab)
             .unwrap_or(&metadata_fallback_buffer.buffer);
-        groups.model_only.insert(
-            metadata_slab_id,
-            layouts.model_only(render_device, pipeline_cache, &model, metadata_buffer),
-        );
-
-        // Create the skinned mesh bind group with the current and previous buffers
-        // (the latter being for motion vector computation).
-        let (skin, prev_skin) = (&skins_uniform.current_buffer, &skins_uniform.prev_buffer);
-        groups.skinned.insert(
-            metadata_slab_id,
-            MeshBindGroupPair {
-                motion_vectors: layouts.skinned_motion(
-                    render_device,
-                    pipeline_cache,
-                    &model,
-                    metadata_buffer,
-                    skin,
-                    prev_skin,
-                ),
-                no_motion_vectors: layouts.skinned(
-                    render_device,
-                    pipeline_cache,
-                    &model,
-                    metadata_buffer,
-                    skin,
-                ),
-            },
-        );
-
-        // Create the morphed bind groups with storage buffers.
-        if weights_uniform.current_buffer.buffer().is_some() {
-            match (render_morph_target_allocator, &mut groups.morph_targets) {
-                (
-                    RenderMorphTargetAllocator::Image {
-                        mesh_id_to_image: _,
-                    },
-                    &mut MeshMorphTargetBindGroups::Uniform(ref mut _morph_targets),
-                ) => {
-                    // We will create it later in `prepare_mesh_morph_target_bind_groups_for_phase_using_uniforms`,
-                    // since the `MeshMorphTargetBindGroups::Uniform` is per-mesh instead of per-slab.
-                }
-
-                (
-                    &RenderMorphTargetAllocator::Storage,
-                    &mut MeshMorphTargetBindGroups::Storage(
-                        ref mut morph_target_storage_bind_groups,
-                    ),
-                ) => {
-                    prepare_mesh_morph_target_bind_groups_for_phase_using_storage(
-                        &model,
-                        layouts,
-                        render_device,
-                        pipeline_cache,
-                        skins_uniform,
-                        weights_uniform,
-                        mesh_allocator,
-                        morph_target_storage_bind_groups,
-                        (metadata_slab_id, metadata_buffer),
-                    );
-                }
-
-                _ => {
-                    error!(
-                    "Mismatched render morph target allocator and mesh morph target bind groups"
-                );
-                }
-            }
-        }
-    }
-
-    if let BindingResource::Buffer(model) = &model {
-        for &(metadata_slab_id, lightmap_slab_id) in lightmap_pairs {
-            let lightmap_slab = &render_lightmaps.slabs[usize::from(lightmap_slab_id)];
-            let metadata_buffer = mesh_allocator
-                .buffer_for_slab(metadata_slab_id)
-                .unwrap_or(&metadata_fallback_buffer.buffer);
-            groups.prepare_lightmap(
-                (metadata_slab_id, lightmap_slab_id),
-                model,
-                metadata_buffer,
-                lightmap_slab,
-                render_lightmaps.bindless_supported,
+        let MeshGeometryBindGroup::Model(group) = prepare_mesh_geometry_bind_group(
+            groups,
+            MeshGeometrySlot::Model(metadata_slab),
+            &model,
+            metadata,
+            None,
+            None,
+            layouts,
+            render_device,
+            pipeline_cache,
+        ) else {
+            unreachable!("model-only slots contain model-only bindings");
+        };
+        groups.model_only.insert(metadata_slab, group);
+        if preparation.skinned_slabs.contains(&metadata_slab) {
+            let MeshGeometryBindGroup::Deformed(pair) = prepare_mesh_geometry_bind_group(
+                groups,
+                MeshGeometrySlot::Skinned(metadata_slab),
+                &model,
+                metadata,
+                Some(skin),
+                None,
                 layouts,
                 render_device,
                 pipeline_cache,
-            );
+            ) else {
+                unreachable!("skinned slots contain deformation bindings");
+            };
+            groups.skinned.insert(metadata_slab, pair);
         }
     }
 
-    // Create the morphed bind groups with uniforms.
-    if weights_uniform.current_buffer.buffer().is_some() {
-        match (render_morph_target_allocator, &mut groups.morph_targets) {
-            (
-                RenderMorphTargetAllocator::Image { mesh_id_to_image },
-                &mut MeshMorphTargetBindGroups::Uniform(ref mut morph_targets),
-            ) => {
-                prepare_mesh_morph_target_bind_groups_for_phase_using_uniforms(
+    for &(metadata_slab_id, lightmap_slab_id) in lightmap_pairs {
+        let lightmap_slab = &render_lightmaps.slabs[usize::from(lightmap_slab_id)];
+        let metadata_buffer = mesh_allocator
+            .buffer_for_slab(metadata_slab_id)
+            .unwrap_or(&metadata_fallback_buffer.buffer);
+        groups.prepare_lightmap(
+            (metadata_slab_id, lightmap_slab_id),
+            &model,
+            metadata_buffer,
+            lightmap_slab,
+            render_lightmaps.bindless_supported,
+            layouts,
+            render_device,
+            pipeline_cache,
+        );
+    }
+
+    let Some(weights) = weights_uniform.current_buffer.buffer() else {
+        groups.finish_frame();
+        return;
+    };
+    let weights = (
+        weights,
+        weights_uniform.prev_buffer.buffer().unwrap_or(weights),
+    );
+    let descriptors = weights_uniform
+        .descriptors_buffer
+        .as_ref()
+        .and_then(|buffer| buffer.buffer());
+
+    match render_morph_target_allocator {
+        RenderMorphTargetAllocator::Image { mesh_id_to_image }
+            if matches!(groups.morph_targets, MeshMorphTargetBindGroups::Uniform(_)) =>
+        {
+            for (id, mesh) in meshes.iter() {
+                if !mesh.has_morph_targets() {
+                    continue;
+                }
+                let Some(image) = mesh_id_to_image.get(&id) else {
+                    continue;
+                };
+                let metadata = mesh_allocator
+                    .mesh_metadata_slice(&id)
+                    .map(|slice| slice.buffer)
+                    .unwrap_or(&metadata_fallback_buffer.buffer);
+                let morph = MeshMorphBindings {
+                    weights,
+                    targets: MorphTargetsResource::Texture(&image.texture_view),
+                    descriptors,
+                };
+                let MeshGeometryBindGroup::Deformed(pair) = prepare_mesh_geometry_bind_group(
+                    groups,
+                    MeshGeometrySlot::UniformMorph(id),
                     &model,
-                    meshes,
+                    metadata,
+                    is_skinned(&mesh.layout).then_some(skin),
+                    Some(morph),
                     layouts,
                     render_device,
                     pipeline_cache,
-                    skins_uniform,
-                    weights_uniform,
-                    mesh_id_to_image,
-                    morph_targets,
-                    mesh_allocator,
-                    metadata_fallback_buffer,
-                );
-            }
-
-            (
-                &RenderMorphTargetAllocator::Storage,
-                &mut MeshMorphTargetBindGroups::Storage(ref mut _morph_target_storage_bind_groups),
-            ) => {
-                // We already filled it above in the loop.
-            }
-
-            _ => {
-                error!(
-                    "Mismatched render morph target allocator and mesh morph target bind groups"
-                );
+                ) else {
+                    unreachable!("morphed slots contain deformation bindings");
+                };
+                if let MeshMorphTargetBindGroups::Uniform(targets) = &mut groups.morph_targets {
+                    targets.insert(id, pair);
+                }
             }
         }
+        RenderMorphTargetAllocator::Storage
+            if matches!(groups.morph_targets, MeshMorphTargetBindGroups::Storage(_)) =>
+        {
+            for (&(metadata_slab, target_slab), &needs_skin) in &preparation.morph_slab_pairs {
+                let metadata = mesh_allocator
+                    .buffer_for_slab(metadata_slab)
+                    .unwrap_or(&metadata_fallback_buffer.buffer);
+                let Some(targets) = mesh_allocator.buffer_for_slab(target_slab) else {
+                    continue;
+                };
+                let morph = MeshMorphBindings {
+                    weights,
+                    targets: MorphTargetsResource::Storage(targets),
+                    descriptors,
+                };
+                for is_skinned in [false, true] {
+                    if is_skinned && !needs_skin {
+                        continue;
+                    }
+                    let MeshGeometryBindGroup::Deformed(pair) = prepare_mesh_geometry_bind_group(
+                        groups,
+                        MeshGeometrySlot::StorageMorph((metadata_slab, target_slab), is_skinned),
+                        &model,
+                        metadata,
+                        is_skinned.then_some(skin),
+                        Some(morph),
+                        layouts,
+                        render_device,
+                        pipeline_cache,
+                    ) else {
+                        unreachable!("morphed slots contain deformation bindings");
+                    };
+                    if let MeshMorphTargetBindGroups::Storage(targets) = &mut groups.morph_targets {
+                        let entry = targets.entry((metadata_slab, target_slab)).or_insert(
+                            MeshMorphTargetStorageBindGroups {
+                                skinned: None,
+                                unskinned: None,
+                            },
+                        );
+                        if is_skinned {
+                            entry.skinned = Some(pair);
+                        } else {
+                            entry.unskinned = Some(pair);
+                        }
+                    }
+                }
+            }
+        }
+        _ => error!("Mismatched render morph target allocator and mesh morph target bind groups"),
     }
+    groups.finish_frame();
 }
 
-/// Creates per-mesh morph target bind groups for a single phase.
-///
-/// This function is only used when the platform doesn't support storage
-/// buffers.
-fn prepare_mesh_morph_target_bind_groups_for_phase_using_uniforms(
-    model: &BindingResource,
-    meshes: &RenderAssets<RenderMesh>,
+fn prepare_mesh_geometry_bind_group(
+    groups: &mut MeshPhaseBindGroups,
+    slot: MeshGeometrySlot,
+    model: &BufferBinding,
+    metadata: &Buffer,
+    skin: Option<(&Buffer, &Buffer)>,
+    morph: Option<MeshMorphBindings<'_>>,
     layouts: &MeshLayouts,
     render_device: &RenderDevice,
     pipeline_cache: &PipelineCache,
-    skins_uniform: &SkinUniforms,
-    weights_uniform: &MorphUniforms,
-    mesh_id_to_image: &HashMap<AssetId<Mesh>, MorphTargetImage>,
-    morph_targets: &mut HashMap<AssetId<Mesh>, MeshBindGroupPair>,
-    mesh_allocator: &MeshAllocator,
-    metadata_fallback_buffer: &MeshMetadataFallbackBuffer,
-) {
-    let (skin, prev_skin) = (&skins_uniform.current_buffer, &skins_uniform.prev_buffer);
-    let weights = weights_uniform
-        .current_buffer
-        .buffer()
-        .expect("Should have a weights buffer by now");
-    let prev_weights = weights_uniform.prev_buffer.buffer().unwrap_or(weights);
-    let maybe_morph_descriptors = weights_uniform
-        .descriptors_buffer
-        .as_ref()
-        .and_then(|descriptors_buffer| descriptors_buffer.buffer());
-
-    for (id, gpu_mesh) in meshes.iter() {
-        if !gpu_mesh.has_morph_targets() {
-            continue;
-        }
-        let Some(morph_targets_image) = mesh_id_to_image.get(&id) else {
-            continue;
-        };
-        let metadata_buffer = mesh_allocator
-            .mesh_metadata_slice(&id)
-            .map(|slice| slice.buffer)
-            .unwrap_or(&metadata_fallback_buffer.buffer);
-        let targets = MorphTargetsResource::Texture(&morph_targets_image.texture_view);
-        let bind_group_pair = if is_skinned(&gpu_mesh.layout) {
-            MeshBindGroupPair {
-                motion_vectors: layouts.morphed_skinned_motion(
-                    render_device,
-                    pipeline_cache,
-                    model,
-                    metadata_buffer,
-                    skin,
-                    weights,
-                    targets,
-                    prev_skin,
-                    prev_weights,
-                    maybe_morph_descriptors,
-                ),
-                no_motion_vectors: layouts.morphed_skinned(
-                    render_device,
-                    pipeline_cache,
-                    model,
-                    metadata_buffer,
-                    skin,
-                    weights,
-                    targets,
-                    maybe_morph_descriptors,
-                ),
+) -> MeshGeometryBindGroup {
+    let (no_motion, motion) = match (skin.is_some(), morph.is_some()) {
+        (false, false) => (&layouts.model_only, &layouts.model_only),
+        (true, false) => (&layouts.skinned, &layouts.skinned_motion),
+        (false, true) => (&layouts.morphed, &layouts.morphed_motion),
+        (true, true) => (&layouts.morphed_skinned, &layouts.morphed_skinned_motion),
+    };
+    let no_motion = pipeline_cache.get_bind_group_layout(no_motion).id();
+    let motion = if skin.is_none() && morph.is_none() {
+        no_motion
+    } else {
+        pipeline_cache.get_bind_group_layout(motion).id()
+    };
+    let resources = MeshGeometryResources {
+        layouts: [no_motion, motion],
+        metadata: metadata.id(),
+        skin: skin.map(|(current, previous)| (current.id(), previous.id())),
+        morph: morph.map(|morph| MeshMorphResources {
+            weights: (morph.weights.0.id(), morph.weights.1.id()),
+            targets: match morph.targets {
+                MorphTargetsResource::Texture(view) => MeshMorphTargetIdentity::Texture(view.id()),
+                MorphTargetsResource::Storage(buffer) => {
+                    MeshMorphTargetIdentity::Storage(buffer.id())
+                }
+            },
+            descriptors: morph.descriptors.map(Buffer::id),
+        }),
+    };
+    groups.prepare_geometry(slot, model, resources, || {
+        let model = BindingResource::Buffer(model.clone());
+        match (skin, morph) {
+            (None, None) => MeshGeometryBindGroup::Model(layouts.model_only(
+                render_device,
+                pipeline_cache,
+                &model,
+                metadata,
+            )),
+            (Some((current, previous)), None) => {
+                MeshGeometryBindGroup::Deformed(MeshBindGroupPair {
+                    motion_vectors: layouts.skinned_motion(
+                        render_device,
+                        pipeline_cache,
+                        &model,
+                        metadata,
+                        current,
+                        previous,
+                    ),
+                    no_motion_vectors: layouts.skinned(
+                        render_device,
+                        pipeline_cache,
+                        &model,
+                        metadata,
+                        current,
+                    ),
+                })
             }
-        } else {
-            MeshBindGroupPair {
+            (None, Some(morph)) => MeshGeometryBindGroup::Deformed(MeshBindGroupPair {
                 motion_vectors: layouts.morphed_motion(
                     render_device,
                     pipeline_cache,
-                    model,
-                    metadata_buffer,
-                    weights,
-                    prev_weights,
-                    targets,
-                    maybe_morph_descriptors,
+                    &model,
+                    metadata,
+                    morph.weights.0,
+                    morph.weights.1,
+                    morph.targets,
+                    morph.descriptors,
                 ),
                 no_motion_vectors: layouts.morphed(
                     render_device,
                     pipeline_cache,
-                    model,
-                    metadata_buffer,
-                    weights,
-                    targets,
-                    maybe_morph_descriptors,
+                    &model,
+                    metadata,
+                    morph.weights.0,
+                    morph.targets,
+                    morph.descriptors,
                 ),
-            }
-        };
-        morph_targets.insert(id, bind_group_pair);
-    }
-}
-
-/// Creates per-slab morph target bind groups for a single phase.
-///
-/// This function is only used when the platform supports storage buffers.
-fn prepare_mesh_morph_target_bind_groups_for_phase_using_storage(
-    model: &BindingResource,
-    layouts: &MeshLayouts,
-    render_device: &RenderDevice,
-    pipeline_cache: &PipelineCache,
-    skins_uniform: &SkinUniforms,
-    weights_uniform: &MorphUniforms,
-    mesh_allocator: &MeshAllocator,
-    morph_target_storage_bind_groups: &mut HashMap<
-        (MeshSlabId, MeshSlabId),
-        MeshMorphTargetStorageBindGroups,
-    >,
-    (metadata_slab_id, metadata_buffer): (MeshSlabId, &Buffer),
-) {
-    let (skin, prev_skin) = (&skins_uniform.current_buffer, &skins_uniform.prev_buffer);
-    let weights = weights_uniform
-        .current_buffer
-        .buffer()
-        .expect("Should have a weights buffer by now");
-    let prev_weights = weights_uniform.prev_buffer.buffer().unwrap_or(weights);
-    let maybe_morph_descriptors = weights_uniform
-        .descriptors_buffer
-        .as_ref()
-        .and_then(|descriptors_buffer| descriptors_buffer.buffer());
-
-    for morph_target_slab_id in mesh_allocator.morph_target_slabs() {
-        let Some(buffer) = mesh_allocator.buffer_for_slab(morph_target_slab_id) else {
-            continue;
-        };
-        let targets = MorphTargetsResource::Storage(buffer);
-        morph_target_storage_bind_groups.insert(
-            (metadata_slab_id, morph_target_slab_id),
-            MeshMorphTargetStorageBindGroups {
-                skinned: Some(MeshBindGroupPair {
+            }),
+            (Some((current, previous)), Some(morph)) => {
+                MeshGeometryBindGroup::Deformed(MeshBindGroupPair {
                     motion_vectors: layouts.morphed_skinned_motion(
                         render_device,
                         pipeline_cache,
-                        model,
-                        metadata_buffer,
-                        skin,
-                        weights,
-                        targets,
-                        prev_skin,
-                        prev_weights,
-                        maybe_morph_descriptors,
+                        &model,
+                        metadata,
+                        current,
+                        morph.weights.0,
+                        morph.targets,
+                        previous,
+                        morph.weights.1,
+                        morph.descriptors,
                     ),
                     no_motion_vectors: layouts.morphed_skinned(
                         render_device,
                         pipeline_cache,
-                        model,
-                        metadata_buffer,
-                        skin,
-                        weights,
-                        targets,
-                        maybe_morph_descriptors,
+                        &model,
+                        metadata,
+                        current,
+                        morph.weights.0,
+                        morph.targets,
+                        morph.descriptors,
                     ),
-                }),
-                unskinned: Some(MeshBindGroupPair {
-                    motion_vectors: layouts.morphed_motion(
-                        render_device,
-                        pipeline_cache,
-                        model,
-                        metadata_buffer,
-                        weights,
-                        prev_weights,
-                        targets,
-                        maybe_morph_descriptors,
-                    ),
-                    no_motion_vectors: layouts.morphed(
-                        render_device,
-                        pipeline_cache,
-                        model,
-                        metadata_buffer,
-                        weights,
-                        targets,
-                        maybe_morph_descriptors,
-                    ),
-                }),
-            },
-        );
-    }
+                })
+            }
+        }
+    })
 }
 
 pub struct SetMeshViewBindGroup<const I: usize>;
@@ -4994,10 +5125,7 @@ mod tests {
     use bevy_tasks::block_on;
     use wgpu_types::DeviceDescriptor;
 
-    use super::{
-        AtomicU64ZeroBitIter, MeshMorphBindGroupKey, MeshPhaseBindGroups, MeshPipelineKey,
-        MeshUniform,
-    };
+    use super::*;
     use crate::{
         lightmap::lightmap_slab_for_test, LightmapSlabIndex, MeshLayouts, LIGHTMAPS_PER_SLAB,
     };
@@ -5350,6 +5478,201 @@ mod tests {
             ),
             reloaded
         );
+    }
+
+    struct GeometryFrame<'a> {
+        slot: MeshGeometrySlot,
+        model: BufferBinding<'a>,
+        metadata: &'a Buffer,
+        skin: Option<(&'a Buffer, &'a Buffer)>,
+        morph: Option<MeshMorphBindings<'a>>,
+    }
+
+    #[test]
+    #[ignore = "requires a graphics adapter"]
+    fn geometry_bindings_reuse_history_and_invalidate_resources() {
+        let instance = RenderInstance::new(Default::default());
+        let adapter = block_on(instance.request_adapter(&Default::default()))
+            .expect("geometry cache regression requires a graphics adapter");
+        for storage in [true, false] {
+            let mut limits = adapter.limits();
+            if !storage {
+                limits.max_storage_buffers_per_shader_stage = 0;
+            }
+            let (device, _queue) = block_on(adapter.request_device(&DeviceDescriptor {
+                required_limits: limits,
+                ..Default::default()
+            }))
+            .expect("geometry cache device");
+            let device = RenderDevice::new(device);
+            let render_adapter = RenderAdapter::new(adapter.clone());
+            let cache = PipelineCache::new(device.clone(), true);
+            let mut layouts = MeshLayouts::new(&device, &render_adapter);
+            let buffer = || {
+                device.create_buffer(&BufferDescriptor {
+                    label: Some("geometry cache regression"),
+                    size: 16384,
+                    usage: BufferUsages::STORAGE | BufferUsages::UNIFORM,
+                    mapped_at_creation: false,
+                })
+            };
+            let (model_a, model_b, metadata, replacement_metadata) =
+                (buffer(), buffer(), buffer(), buffer());
+            let (skin_a, skin_b, previous_skin) = (buffer(), buffer(), buffer());
+            let (weight_a, weight_b, previous_weights) = (buffer(), buffer(), buffer());
+            let (targets, replacement_targets, descriptors, replacement_descriptors) =
+                (buffer(), buffer(), buffer(), buffer());
+            let texture = device.create_texture(&TextureDescriptor {
+                label: Some("geometry cache morph displacements"),
+                size: Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D3,
+                format: TextureFormat::Rgba32Float,
+                usage: TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let texture_a = texture.create_view(&Default::default());
+            let texture_b = texture.create_view(&Default::default());
+            let slot = if storage {
+                MeshGeometrySlot::StorageMorph((MeshSlabId::default(), MeshSlabId::default()), true)
+            } else {
+                MeshGeometrySlot::UniformMorph(AssetId::default())
+            };
+            let initial_morph = MeshMorphBindings {
+                weights: (&weight_a, &weight_b),
+                targets: if storage {
+                    MorphTargetsResource::Storage(&targets)
+                } else {
+                    MorphTargetsResource::Texture(&texture_a)
+                },
+                descriptors: storage.then_some(&descriptors),
+            };
+            let mut frame = GeometryFrame {
+                slot,
+                model: BufferBinding {
+                    buffer: &model_a,
+                    offset: 0,
+                    size: BufferSize::new(MeshUniform::min_size().get()),
+                },
+                metadata: &metadata,
+                skin: Some((&skin_a, &skin_b)),
+                morph: Some(initial_morph),
+            };
+            let mut groups = MeshPhaseBindGroups::new(&device);
+            let prepare = |groups: &mut MeshPhaseBindGroups,
+                           frame: &GeometryFrame<'_>,
+                           layouts: &MeshLayouts| {
+                groups.begin_frame(&HashSet::default());
+                let prepared = prepare_mesh_geometry_bind_group(
+                    groups,
+                    frame.slot,
+                    &frame.model,
+                    frame.metadata,
+                    frame.skin,
+                    frame.morph,
+                    layouts,
+                    &device,
+                    &cache,
+                );
+                groups.finish_frame();
+                match prepared {
+                    MeshGeometryBindGroup::Model(group) => (group.id(), group.id()),
+                    MeshGeometryBindGroup::Deformed(pair) => {
+                        (pair.no_motion_vectors.id(), pair.motion_vectors.id())
+                    }
+                }
+            };
+            let first = prepare(&mut groups, &frame, &layouts);
+            frame.model.buffer = &model_b;
+            frame.skin = Some((&skin_b, &skin_a));
+            frame.morph.as_mut().expect("morphing scenario").weights = (&weight_b, &weight_a);
+            let second = prepare(&mut groups, &frame, &layouts);
+            assert_ne!(
+                first, second,
+                "current and previous buffers change on a frame swap"
+            );
+            frame.model.buffer = &model_a;
+            frame.skin = Some((&skin_a, &skin_b));
+            frame.morph = Some(initial_morph);
+            assert_eq!(
+                prepare(&mut groups, &frame, &layouts),
+                first,
+                "A/B/A reuses the complete deformation history"
+            );
+
+            frame.skin = Some((&skin_a, &previous_skin));
+            let changed_skin = prepare(&mut groups, &frame, &layouts);
+            assert_ne!(
+                changed_skin, first,
+                "previous skin backing belongs to the identity"
+            );
+            frame.morph.as_mut().expect("morphing scenario").weights.1 = &previous_weights;
+            let changed_weights = prepare(&mut groups, &frame, &layouts);
+            assert_ne!(
+                changed_weights, changed_skin,
+                "previous weight backing belongs to the identity"
+            );
+            frame.morph.as_mut().expect("morphing scenario").targets = if storage {
+                MorphTargetsResource::Storage(&replacement_targets)
+            } else {
+                MorphTargetsResource::Texture(&texture_b)
+            };
+            let changed_targets = prepare(&mut groups, &frame, &layouts);
+            assert_ne!(
+                changed_targets, changed_weights,
+                "storage and image displacement resources are tracked"
+            );
+            frame.metadata = &replacement_metadata;
+            let changed_metadata = prepare(&mut groups, &frame, &layouts);
+            assert_ne!(changed_metadata, changed_targets);
+            if storage {
+                frame.morph.as_mut().expect("morphing scenario").descriptors =
+                    Some(&replacement_descriptors);
+                assert_ne!(prepare(&mut groups, &frame, &layouts), changed_metadata);
+            }
+            let before_layout = prepare(&mut groups, &frame, &layouts);
+            layouts.morphed_skinned.entries[0].visibility ^= ShaderStages::FRAGMENT;
+            assert_ne!(prepare(&mut groups, &frame, &layouts), before_layout);
+
+            frame.slot = MeshGeometrySlot::Model(MeshSlabId::default());
+            frame.skin = None;
+            frame.morph = None;
+            let plain = prepare(&mut groups, &frame, &layouts);
+            frame.model.offset = u64::from(device.limits().min_uniform_buffer_offset_alignment)
+                .max(u64::from(
+                    device.limits().min_storage_buffer_offset_alignment,
+                ));
+            let offset = prepare(&mut groups, &frame, &layouts);
+            assert_ne!(offset, plain, "model binding base belongs to the identity");
+            frame.model.size = BufferSize::new(MeshUniform::min_size().get() * 2);
+            let ranged = prepare(&mut groups, &frame, &layouts);
+            assert_ne!(ranged, offset, "model binding size belongs to the identity");
+            assert_eq!(prepare(&mut groups, &frame, &layouts), ranged);
+            frame.slot = MeshGeometrySlot::Skinned(MeshSlabId::default());
+            frame.skin = Some((&skin_a, &skin_b));
+            prepare(&mut groups, &frame, &layouts);
+            frame.slot = MeshGeometrySlot::UniformMorph(AssetId::default());
+            frame.skin = None;
+            frame.morph = Some(initial_morph);
+            prepare(&mut groups, &frame, &layouts);
+            assert!(groups
+                .geometry_cache
+                .values()
+                .all(|variants| variants.len() <= 2));
+            groups.begin_frame(&HashSet::default());
+            groups.finish_frame();
+            groups.begin_frame(&HashSet::default());
+            groups.finish_frame();
+            assert!(
+                groups.geometry_cache.is_empty(),
+                "unused resource owners expire"
+            );
+        }
     }
 
     #[test]
