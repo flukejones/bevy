@@ -15,10 +15,10 @@ use bevy_core_pipeline::{
 };
 use bevy_ecs::{
     component::Component,
-    entity::Entity,
+    entity::{Entity, EntityHashMap},
     query::Has,
     resource::Resource,
-    system::{Commands, Query, Res},
+    system::{Commands, Local, Query, Res},
     world::{FromWorld, World},
 };
 use bevy_light::{EnvironmentMapLight, IrradianceVolume};
@@ -36,8 +36,9 @@ use bevy_render::{
         VISIBILITY_RANGES_STORAGE_BUFFER_COUNT, VISIBILITY_RANGE_UNIFORM_BUFFER_SIZE,
     },
 };
-use core::fmt::Write;
 use core::num::NonZero;
+use core::{array::from_fn, fmt::Write};
+use smallvec::SmallVec;
 
 use crate::{
     contact_shadows::{
@@ -645,6 +646,148 @@ pub struct MeshViewBindGroup {
     pub empty: BindGroup,
 }
 
+/// Retains view bindings across frames; dynamic uniform offsets are not cached.
+#[derive(Default)]
+pub struct MeshViewBindGroupCache {
+    views: EntityHashMap<CachedMeshViewBindGroups>,
+}
+
+#[derive(Default)]
+struct CachedMeshViewBindGroups {
+    seen: bool,
+    groups: [SmallVec<[CachedMeshViewBindGroup; 2]>; 3],
+}
+
+struct CachedMeshViewBindGroup {
+    layout: BindGroupLayoutId,
+    entries: Vec<(u32, MeshViewBinding)>,
+    bind_group: BindGroup,
+    age: u8,
+}
+
+enum MeshViewBinding {
+    Buffer(Buffer, u64, Option<BufferSize>),
+    Sampler(Sampler),
+    TextureView(TextureView),
+    TextureViewArray(Vec<TextureView>),
+}
+
+impl MeshViewBinding {
+    fn new(resource: &BindingResource<'_>) -> Self {
+        match resource {
+            BindingResource::Buffer(binding) => {
+                Self::Buffer(binding.buffer.clone().into(), binding.offset, binding.size)
+            }
+            BindingResource::Sampler(sampler) => Self::Sampler((*sampler).clone().into()),
+            BindingResource::TextureView(view) => Self::TextureView((*view).clone().into()),
+            BindingResource::TextureViewArray(views) => {
+                Self::TextureViewArray(views.iter().map(|view| (*view).clone().into()).collect())
+            }
+            _ => unreachable!("mesh views bind buffers, samplers, and texture views"),
+        }
+    }
+
+    fn matches(&self, resource: &BindingResource<'_>) -> bool {
+        match (self, resource) {
+            (Self::Buffer(buffer, offset, size), BindingResource::Buffer(binding)) => {
+                **buffer == *binding.buffer && *offset == binding.offset && *size == binding.size
+            }
+            (Self::Sampler(cached), BindingResource::Sampler(current)) => **cached == **current,
+            (Self::TextureView(cached), BindingResource::TextureView(current)) => {
+                **cached == **current
+            }
+            (Self::TextureViewArray(cached), BindingResource::TextureViewArray(current)) => {
+                cached.len() == current.len()
+                    && cached
+                        .iter()
+                        .zip(*current)
+                        .all(|(cached, current)| **cached == **current)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl MeshViewBindGroupCache {
+    fn begin_frame(&mut self) {
+        for cached in self.views.values_mut() {
+            cached.seen = false;
+            for group in cached.groups.iter_mut().flatten() {
+                group.age = group.age.saturating_add(1);
+            }
+        }
+    }
+
+    fn finish_frame(&mut self, commands: &mut Commands) {
+        self.views.retain(|&entity, cached| {
+            if !cached.seen {
+                commands.entity(entity).try_remove::<MeshViewBindGroup>();
+            }
+            cached.seen
+        });
+    }
+}
+
+impl CachedMeshViewBindGroups {
+    fn prepare(
+        &mut self,
+        render_device: &RenderDevice,
+        layouts: [&BindGroupLayout; 3],
+        entries: [&[BindGroupEntry<'_>]; 3],
+        offsets: ArrayVec<u32, 7>,
+    ) -> MeshViewBindGroup {
+        self.seen = true;
+        let [main, binding_array, empty] =
+            from_fn(|index| {
+                let groups = &mut self.groups[index];
+                let layout = layouts[index];
+                let entries = entries[index];
+                let bind_group = if let Some(cached) =
+                    groups.iter_mut().find(|cached| {
+                        cached.layout == layout.id()
+                            && cached.entries.len() == entries.len()
+                            && cached.entries.iter().zip(entries).all(
+                                |((binding, resource), entry)| {
+                                    *binding == entry.binding && resource.matches(&entry.resource)
+                                },
+                            )
+                    }) {
+                    cached.age = 0;
+                    cached.bind_group.clone()
+                } else {
+                    let bind_group = render_device.create_bind_group(
+                        [
+                            "mesh_view_bind_group",
+                            "mesh_view_bind_group_binding_array",
+                            "mesh_view_bind_group_empty",
+                        ][index],
+                        layout,
+                        entries,
+                    );
+                    groups.push(CachedMeshViewBindGroup {
+                        layout: layout.id(),
+                        entries: entries
+                            .iter()
+                            .map(|entry| (entry.binding, MeshViewBinding::new(&entry.resource)))
+                            .collect(),
+                        bind_group: bind_group.clone(),
+                        age: 0,
+                    });
+                    bind_group
+                };
+                // Keep the preceding frame's backing when phase buffers alternate.
+                groups.retain(|cached| cached.age < 2);
+                bind_group
+            });
+        MeshViewBindGroup {
+            main,
+            main_offsets: offsets,
+            binding_array,
+            empty,
+        }
+    }
+}
+
 pub fn prepare_mesh_view_bind_groups(
     mut commands: Commands,
     (render_device, pipeline_cache, render_adapter): (
@@ -709,13 +852,15 @@ pub fn prepare_mesh_view_bind_groups(
         Res<AreaLightLuts>,
         Res<DfgLut>,
     ),
-    linear_sampler: Res<LinearSampler>,
+    (linear_sampler, mut bind_group_cache): (Res<LinearSampler>, Local<MeshViewBindGroupCache>),
     // TODO: Figure out how to reuse the memory. `BindGroupEntry` is non-send on wasm with atomics.
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))] mut entries_cache: Local<
+        Vec<BindGroupEntry>,
+    >,
     #[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
-    mut entries_cache: bevy_ecs::system::Local<Vec<BindGroupEntry>>,
-    #[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
-    mut entries_binding_array_cache: bevy_ecs::system::Local<Vec<BindGroupEntry>>,
+    mut entries_binding_array_cache: Local<Vec<BindGroupEntry>>,
 ) {
+    bind_group_cache.begin_frame();
     if let (
         Some(view_binding),
         Some(light_binding),
@@ -1021,24 +1166,17 @@ pub fn prepare_mesh_view_bind_groups(
             }
 
             let layout = mesh_pipeline.get_view_layout(layout_key);
-            commands.entity(entity).insert((MeshViewBindGroup {
-                main_offsets: offsets,
-                main: render_device.create_bind_group(
-                    "mesh_view_bind_group",
-                    &pipeline_cache.get_bind_group_layout(&layout.main_layout),
-                    &entries,
-                ),
-                binding_array: render_device.create_bind_group(
-                    "mesh_view_bind_group_binding_array",
-                    &pipeline_cache.get_bind_group_layout(&layout.binding_array_layout),
-                    &entries_binding_array,
-                ),
-                empty: render_device.create_bind_group(
-                    "mesh_view_bind_group_empty",
-                    &pipeline_cache.get_bind_group_layout(&layout.empty_layout),
-                    &[],
-                ),
-            },));
+            let main_layout = pipeline_cache.get_bind_group_layout(&layout.main_layout);
+            let binding_array_layout =
+                pipeline_cache.get_bind_group_layout(&layout.binding_array_layout);
+            let empty_layout = pipeline_cache.get_bind_group_layout(&layout.empty_layout);
+            let groups = bind_group_cache.views.entry(entity).or_default().prepare(
+                &render_device,
+                [&main_layout, &binding_array_layout, &empty_layout],
+                [&entries, &entries_binding_array, &[]],
+                offsets,
+            );
+            commands.entity(entity).insert(groups);
 
             #[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
             {
@@ -1056,5 +1194,247 @@ pub fn prepare_mesh_view_bind_groups(
                     .collect();
             }
         }
+    }
+    bind_group_cache.finish_frame(&mut commands);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_platform::future::block_on;
+    use bevy_render::renderer::RenderInstance;
+    use wgpu_types::DeviceDescriptor;
+
+    #[test]
+    #[ignore = "requires a graphics adapter with texture binding arrays"]
+    fn view_bindings_reuse_alternating_resources_and_retire_absent_views() {
+        let instance = RenderInstance::new(Default::default());
+        let adapter = block_on(instance.request_adapter(&Default::default()))
+            .expect("a graphics adapter is available");
+        let (device, _queue) = block_on(adapter.request_device(&DeviceDescriptor {
+            required_features: WgpuFeatures::TEXTURE_BINDING_ARRAY,
+            required_limits: adapter.limits(),
+            ..Default::default()
+        }))
+        .expect("the adapter supports texture binding arrays");
+        let device = RenderDevice::new(device);
+        let main_layout = device.create_bind_group_layout(
+            "cached view test",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::FRAGMENT,
+                (
+                    storage_buffer_read_only::<u32>(true),
+                    sampler(SamplerBindingType::NonFiltering),
+                ),
+            ),
+        );
+        let array_layout = device.create_bind_group_layout(
+            "cached view array test",
+            &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: false },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: NonZero::new(2),
+            }],
+        );
+        let empty_layout = device.create_bind_group_layout("cached empty view test", &[]);
+        let buffer = || {
+            device.create_buffer(&BufferDescriptor {
+                label: None,
+                size: 1024,
+                usage: BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            })
+        };
+        let texture = || {
+            device
+                .create_texture(&TextureDescriptor {
+                    label: None,
+                    size: Extent3d {
+                        width: 1,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: TextureDimension::D2,
+                    format: TextureFormat::Rgba8Unorm,
+                    usage: TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&TextureViewDescriptor::default())
+        };
+        let a = buffer();
+        let b = buffer();
+        let textures = [texture(), texture()];
+        let view_sampler = device.create_sampler(&SamplerDescriptor::default());
+        let mut world = World::new();
+        let view = world.spawn_empty().id();
+        let mut cache = MeshViewBindGroupCache::default();
+        let mut prepare = |cache: &mut MeshViewBindGroupCache,
+                           buffer: &Buffer,
+                           offset,
+                           size,
+                           textures: [&TextureView; 2],
+                           sampler: &Sampler,
+                           layout: &BindGroupLayout,
+                           dynamic_offset| {
+            cache.begin_frame();
+            let textures = textures.map(|view| &**view);
+            let main = BindGroupEntries::sequential((
+                BufferBinding {
+                    buffer,
+                    offset,
+                    size,
+                },
+                sampler,
+            ));
+            let array = BindGroupEntries::single(textures.as_slice());
+            let group = cache.views.entry(view).or_default().prepare(
+                &device,
+                [layout, &array_layout, &empty_layout],
+                [&main, &array, &[]],
+                ArrayVec::from_iter([dynamic_offset]),
+            );
+            let result = (
+                group.main.id(),
+                group.binding_array.id(),
+                group.empty.id(),
+                group.main_offsets[0],
+            );
+            let mut commands = world.commands();
+            commands.entity(view).insert(group);
+            cache.finish_frame(&mut commands);
+            world.flush();
+            result
+        };
+        let views = [&textures[0], &textures[1]];
+        let first = prepare(
+            &mut cache,
+            &a,
+            0,
+            NonZero::new(4),
+            views,
+            &view_sampler,
+            &main_layout,
+            0,
+        );
+        let second = prepare(
+            &mut cache,
+            &b,
+            0,
+            NonZero::new(4),
+            views,
+            &view_sampler,
+            &main_layout,
+            256,
+        );
+        assert_ne!(first.0, second.0, "a new backing needs new main bindings");
+        assert_eq!((first.1, first.2), (second.1, second.2));
+        let third = prepare(
+            &mut cache,
+            &a,
+            0,
+            NonZero::new(4),
+            views,
+            &view_sampler,
+            &main_layout,
+            512,
+        );
+        assert_eq!(
+            (third.0, third.1, third.2),
+            (first.0, first.1, first.2),
+            "A/B/A reuses both backings"
+        );
+        assert_eq!(
+            third.3, 512,
+            "a cache hit refreshes the current dynamic offset"
+        );
+
+        let mut previous = third.0;
+        for (offset, size) in [(256, NonZero::new(4)), (256, NonZero::new(8)), (256, None)] {
+            let current = prepare(
+                &mut cache,
+                &a,
+                offset,
+                size,
+                views,
+                &view_sampler,
+                &main_layout,
+                0,
+            );
+            assert_ne!(
+                current.0, previous,
+                "buffer binding base and size belong to the identity"
+            );
+            previous = current.0;
+            assert!(cache.views[&view]
+                .groups
+                .iter()
+                .all(|groups| groups.len() <= 2));
+        }
+        let reordered = prepare(
+            &mut cache,
+            &a,
+            256,
+            None,
+            [views[1], views[0]],
+            &view_sampler,
+            &main_layout,
+            0,
+        );
+        assert_eq!(reordered.0, previous);
+        assert_ne!(
+            reordered.1, first.1,
+            "texture array order belongs to the identity"
+        );
+        assert_eq!(reordered.2, first.2);
+
+        let replacement_sampler = device.create_sampler(&SamplerDescriptor::default());
+        let changed_sampler = prepare(
+            &mut cache,
+            &a,
+            256,
+            None,
+            views,
+            &replacement_sampler,
+            &main_layout,
+            0,
+        );
+        assert_ne!(changed_sampler.0, reordered.0);
+        let replacement_layout = device.create_bind_group_layout(
+            "replacement view layout",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::FRAGMENT,
+                (
+                    storage_buffer_read_only::<u32>(true),
+                    sampler(SamplerBindingType::NonFiltering),
+                ),
+            ),
+        );
+        let changed_layout = prepare(
+            &mut cache,
+            &a,
+            256,
+            None,
+            views,
+            &replacement_sampler,
+            &replacement_layout,
+            0,
+        );
+        assert_ne!(changed_layout.0, changed_sampler.0);
+        drop(prepare);
+        cache.begin_frame();
+        cache.finish_frame(&mut world.commands());
+        world.flush();
+        assert!(cache.views.is_empty());
+        assert!(
+            world.get::<MeshViewBindGroup>(view).is_none(),
+            "an unavailable view cannot retain drawable bindings"
+        );
     }
 }
